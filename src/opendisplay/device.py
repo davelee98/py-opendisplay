@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import zlib
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -933,6 +934,8 @@ class OpenDisplayDevice:
             if partial_outcome == "fallback_full":
                 _LOGGER.info("Partial path unavailable or unnecessary; continuing with full upload")
 
+        full_upload_etag = _generate_etag() if state is not None else None
+
         if compress and supports_compression and compressed_data and len(compressed_data) < MAX_COMPRESSED_SIZE:
             _LOGGER.info("Using compressed upload protocol (size: %d bytes)", len(compressed_data))
             await self._execute_upload(
@@ -942,6 +945,7 @@ class OpenDisplayDevice:
                 compressed_data=compressed_data,
                 uncompressed_size=len(image_data),
                 progress_callback=progress_callback,
+                new_etag=full_upload_etag,
             )
         else:
             if compress and not supports_compression:
@@ -951,12 +955,16 @@ class OpenDisplayDevice:
             else:
                 _LOGGER.info("Compression disabled or no compressed data, using uncompressed protocol")
             await self._execute_upload(
-                image_data, refresh_mode, use_compression=False, progress_callback=progress_callback
+                image_data,
+                refresh_mode,
+                use_compression=False,
+                progress_callback=progress_callback,
+                new_etag=full_upload_etag,
             )
 
         _LOGGER.info("Image upload complete")
         if state is not None:
-            self._update_partial_state(state, processed_image, image_data)
+            self._update_partial_state(state, processed_image, image_data, full_upload_etag)
         return processed_image
 
     async def upload_prepared_image(
@@ -1000,6 +1008,8 @@ class OpenDisplayDevice:
         supports_compression = (
             self._config.displays[0].supports_zip if (self._config and self._config.displays) else True
         )
+        full_upload_etag = _generate_etag() if state is not None else None
+
         if compress and supports_compression and compressed_data and len(compressed_data) < MAX_COMPRESSED_SIZE:
             _LOGGER.info("Using compressed upload protocol (size: %d bytes)", len(compressed_data))
             await self._execute_upload(
@@ -1009,6 +1019,7 @@ class OpenDisplayDevice:
                 compressed_data=compressed_data,
                 uncompressed_size=len(image_data),
                 progress_callback=progress_callback,
+                new_etag=full_upload_etag,
             )
         else:
             if compress and not supports_compression:
@@ -1018,27 +1029,33 @@ class OpenDisplayDevice:
             else:
                 _LOGGER.info("Compression disabled or no compressed data, using uncompressed protocol")
             await self._execute_upload(
-                image_data, refresh_mode, use_compression=False, progress_callback=progress_callback
+                image_data,
+                refresh_mode,
+                use_compression=False,
+                progress_callback=progress_callback,
+                new_etag=full_upload_etag,
             )
 
         _LOGGER.info("Prepared image upload complete")
         if state is not None:
-            self._update_partial_state(state, processed_image, image_data)
+            self._update_partial_state(state, processed_image, image_data, full_upload_etag)
 
     def _update_partial_state(
         self,
         state: PartialState,
         processed_image: Image.Image,
         image_data: bytes,
+        etag: int | None = None,
     ) -> None:
         """After a successful full upload, refresh state to reflect what's now on the panel.
 
-        Generates a fresh non-zero etag, stashes the palette pixels for diffing
-        on the next call. ``image_data`` is unused but kept for API symmetry.
+        Stores the etag committed to the device on 0x72 (or generates one if
+        absent), then stashes the palette pixels for diffing on the next call.
+        ``image_data`` is unused but kept for API symmetry.
         """
         del image_data
         palette_image = processed_image.convert("P") if processed_image.mode != "P" else processed_image
-        state.etag = _generate_etag()
+        state.etag = _generate_etag() if etag is None else etag
         state.last_image = palette_image.tobytes()
         state.width, state.height = processed_image.size
         state.bytes_per_pixel = 1
@@ -1057,6 +1074,7 @@ class OpenDisplayDevice:
         - "fallback_full": caller must do a full upload (and refresh state).
         """
         del image_data  # full encoding is per-segment for partial path
+        del refresh_mode  # Partial transfers always request the panel's PARTIAL refresh mode.
 
         color_scheme = self.color_scheme
         if color_scheme in (ColorScheme.BWR, ColorScheme.BWY):
@@ -1083,35 +1101,96 @@ class OpenDisplayDevice:
             return "fallback_full"
 
         chunk_size = ENCRYPTED_CHUNK_SIZE if self._session_key is not None else CHUNK_SIZE
-        max_segment_pixel_bytes = chunk_size - SEGMENT_HEADER_SIZE
-        if max_segment_pixel_bytes <= 0:
+        max_segment_wire_bytes = chunk_size - 2
+        if max_segment_wire_bytes <= SEGMENT_HEADER_SIZE:
             return "fallback_full"
 
         strategy: DiffStrategy = diff_strategy or RecursiveBoundingBoxStrategy()
-        new_segments = strategy.diff(old_palette, new_palette, width, height, 1, max_segment_pixel_bytes)
+        max_raw_segment_bytes = max_segment_wire_bytes - SEGMENT_HEADER_SIZE
+
+        old_palette_image = palette_image.copy()
+        old_palette_image.frombytes(old_palette)
+
+        def segment_fits(seg: Segment) -> bool:
+            new_wire = self._encode_segment_wire(palette_image, seg.x, seg.y, seg.width, seg.height, color_scheme)
+            old_wire = self._encode_segment_wire(
+                old_palette_image, seg.x, seg.y, seg.width, seg.height, color_scheme
+            )
+            return (
+                self._partial_payload_fits(new_wire, max_segment_wire_bytes)
+                and self._partial_payload_fits(old_wire, max_segment_wire_bytes)
+            )
+
+        if isinstance(strategy, RecursiveBoundingBoxStrategy):
+            new_segments = strategy.diff_with_fit(old_palette, new_palette, width, height, 1, segment_fits)
+        else:
+            new_segments = strategy.diff(old_palette, new_palette, width, height, 1, max_raw_segment_bytes)
+        _LOGGER.debug(
+            "Partial path diff: old_etag=0x%08x, image=%dx%d, max_segment_wire_bytes=%d, changed_segments=%d",
+            state.etag,
+            width,
+            height,
+            max_segment_wire_bytes,
+            len(new_segments),
+        )
         if not new_segments:
             _LOGGER.debug("Partial path: local state already matches target image; forcing full upload to resync")
             return "fallback_full"
 
+        for i, seg in enumerate(new_segments[:8]):
+            _LOGGER.debug(
+                "Partial segment %d: x=%d y=%d w=%d h=%d pixels=%d",
+                i,
+                seg.x,
+                seg.y,
+                seg.width,
+                seg.height,
+                seg.pixel_count,
+            )
+        if len(new_segments) > 8:
+            _LOGGER.debug("Partial segment list truncated in logs (%d additional segments)", len(new_segments) - 8)
+
         # Build (Segment, wire_pixels) pairs for both planes.
         # PLANE_0 = new image, PLANE_1 = old image.
-        old_palette_image = palette_image.copy()
-        old_palette_image.frombytes(old_palette)
-
         pairs: list[tuple[Segment, bytes]] = []
+        total_wire_bytes = 0
+        compressed_pairs = 0
         for seg in new_segments:
             new_wire = self._encode_segment_wire(palette_image, seg.x, seg.y, seg.width, seg.height, color_scheme)
             old_wire = self._encode_segment_wire(
                 old_palette_image, seg.x, seg.y, seg.width, seg.height, color_scheme
             )
-            new_seg = Segment(seg.x, seg.y, seg.width, seg.height, b"", plane=0)
-            old_seg = Segment(seg.x, seg.y, seg.width, seg.height, b"", plane=1)
-            pairs.append((new_seg, new_wire))
-            pairs.append((old_seg, old_wire))
+            new_payload, new_compressed = self._choose_partial_payload(new_wire, max_segment_wire_bytes)
+            old_payload, old_compressed = self._choose_partial_payload(old_wire, max_segment_wire_bytes)
+            if (
+                SEGMENT_HEADER_SIZE + len(new_payload) > max_segment_wire_bytes
+                or SEGMENT_HEADER_SIZE + len(old_payload) > max_segment_wire_bytes
+            ):
+                _LOGGER.debug("Partial path skipped: custom diff produced a segment larger than the active MTU")
+                return "fallback_full"
+            new_seg = Segment(seg.x, seg.y, seg.width, seg.height, b"", plane=0, compressed=new_compressed)
+            old_seg = Segment(seg.x, seg.y, seg.width, seg.height, b"", plane=1, compressed=old_compressed)
+            pairs.append((new_seg, new_payload))
+            pairs.append((old_seg, old_payload))
+            total_wire_bytes += len(new_payload) + len(old_payload)
+            compressed_pairs += int(new_compressed) + int(old_compressed)
 
         packets = pack_segments_into_packets(pairs, mtu=chunk_size)
+        _LOGGER.debug(
+            "Partial packetization: plane_pairs=%d, compressed_pairs=%d, total_payload_bytes=%d, packet_count=%d, mtu=%d",
+            len(pairs),
+            compressed_pairs,
+            total_wire_bytes,
+            len(packets),
+            chunk_size,
+        )
+        for i, pkt in enumerate(packets[:8]):
+            _LOGGER.debug("Partial packet %d: payload_bytes=%d", i, len(pkt) - 2)
+        if len(packets) > 8:
+            _LOGGER.debug("Partial packet list truncated in logs (%d additional packets)", len(packets) - 8)
 
         new_etag = _generate_etag()
+        _LOGGER.debug("Partial upload start: old_etag=0x%08x new_etag=0x%08x", state.etag, new_etag)
 
         # 1. 0x76 partial START with protocol version + old_etag
         await self._write(build_direct_write_partial_start(state.etag))
@@ -1128,7 +1207,8 @@ class OpenDisplayDevice:
         validate_ack_response(response, CommandCode.DIRECT_WRITE_PARTIAL_START)
 
         # 2. 0x77 packets — ACK after each
-        for pkt in packets:
+        for i, pkt in enumerate(packets):
+            _LOGGER.debug("Sending partial packet %d/%d (%d bytes total)", i + 1, len(packets), len(pkt))
             await self._write(pkt)
             ack = await self._read(self.TIMEOUT_ACK)
             nack = parse_nack(ack)
@@ -1136,11 +1216,12 @@ class OpenDisplayDevice:
                 opcode, err = nack
                 state.etag = 0
                 state.last_image = None
+                _LOGGER.debug("Partial packet %d NACK: opcode=0x%02x err=0x%02x", i + 1, opcode, err)
                 raise ProtocolError(f"Partial 0x77 NACK: opcode=0x{opcode:02x} err=0x{err:02x}")
             validate_ack_response(ack, CommandCode.DIRECT_WRITE_PARTIAL_DATA)
 
         # 3. 0x72 END with new_etag
-        await self._write(build_direct_write_end_with_etag(refresh_mode.value, new_etag))
+        await self._write(build_direct_write_end_with_etag(RefreshMode.PARTIAL.value, new_etag))
         response = await self._read(self.TIMEOUT_ACK)
         validate_ack_response(response, CommandCode.DIRECT_WRITE_END)
 
@@ -1161,6 +1242,22 @@ class OpenDisplayDevice:
         return "success"
 
     @staticmethod
+    def _partial_payload_fits(wire_pixels: bytes, max_segment_wire_bytes: int) -> bool:
+        """Return whether raw or compressed 0x77 segment payload fits one packet."""
+        if SEGMENT_HEADER_SIZE + len(wire_pixels) <= max_segment_wire_bytes:
+            return True
+        compressed = zlib.compress(wire_pixels, level=6)
+        return len(compressed) < len(wire_pixels) and SEGMENT_HEADER_SIZE + len(compressed) <= max_segment_wire_bytes
+
+    @staticmethod
+    def _choose_partial_payload(wire_pixels: bytes, max_segment_wire_bytes: int) -> tuple[bytes, bool]:
+        """Choose raw or zlib-compressed bytes for one 0x77 segment payload."""
+        compressed = zlib.compress(wire_pixels, level=6)
+        if len(compressed) < len(wire_pixels) and SEGMENT_HEADER_SIZE + len(compressed) <= max_segment_wire_bytes:
+            return compressed, True
+        return wire_pixels, False
+
+    @staticmethod
     def _encode_segment_wire(
         palette_image: Image.Image,
         x: int,
@@ -1169,8 +1266,43 @@ class OpenDisplayDevice:
         h: int,
         color_scheme: ColorScheme,
     ) -> bytes:
-        """Crop the palette image to (x,y,w,h) and encode to the panel's wire format."""
+        """Crop the palette image to (x,y,w,h) and encode to tightly packed wire bytes.
+
+        Partial 0x77 segments are packed over the full rectangle pixel stream with
+        no per-row padding. The normal full-frame encoders pad each row to a byte
+        boundary, which breaks the firmware's segment-length calculation for
+        widths that are not aligned to 8/4/2 pixels.
+        """
         cropped = palette_image.crop((x, y, x + w, y + h))
+        pixels = list(cropped.getdata())
+
+        if color_scheme == ColorScheme.MONO:
+            output = bytearray((len(pixels) + 7) // 8)
+            for i, palette_idx in enumerate(pixels):
+                if palette_idx > 0:
+                    output[i // 8] |= 1 << (7 - (i % 8))
+            return bytes(output)
+
+        if color_scheme in (ColorScheme.BWRY, ColorScheme.GRAYSCALE_4):
+            output = bytearray((len(pixels) + 3) // 4)
+            for i, palette_idx in enumerate(pixels):
+                shift = (3 - (i % 4)) * 2
+                output[i // 4] |= (palette_idx & 0x03) << shift
+            return bytes(output)
+
+        if color_scheme in (ColorScheme.BWGBRY, ColorScheme.GRAYSCALE_16):
+            output = bytearray((len(pixels) + 1) // 2)
+            bwgbry_map = {0: 0, 1: 1, 2: 2, 3: 3, 4: 5, 5: 6}
+            for i, palette_idx in enumerate(pixels):
+                value = palette_idx & 0x0F
+                if color_scheme == ColorScheme.BWGBRY:
+                    value = bwgbry_map.get(value, 0)
+                if i % 2 == 0:
+                    output[i // 2] |= value << 4
+                else:
+                    output[i // 2] |= value
+            return bytes(output)
+
         return encode_image(cropped, color_scheme)
 
     async def _execute_upload(
@@ -1181,6 +1313,7 @@ class OpenDisplayDevice:
         compressed_data: bytes | None = None,
         uncompressed_size: int | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        new_etag: int | None = None,
     ) -> None:
         """Execute image upload using compressed or uncompressed protocol.
 
@@ -1218,7 +1351,11 @@ class OpenDisplayDevice:
 
         # 4. Send END (unless device auto-triggered refresh), then wait for 0x73
         if not auto_completed:
-            end_cmd = build_direct_write_end_command(refresh_mode.value)
+            end_cmd = (
+                build_direct_write_end_with_etag(refresh_mode.value, new_etag)
+                if new_etag is not None
+                else build_direct_write_end_command(refresh_mode.value)
+            )
             await self._write(end_cmd)
 
             response = await self._read(self.TIMEOUT_ACK)

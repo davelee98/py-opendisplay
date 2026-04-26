@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -30,8 +31,14 @@ ERR_ETAG_MISMATCH = 0x01   # on 0x76: client must fall back to full transfer
 ERR_MIXED_DATA    = 0x02   # on 0x71 or 0x77: aborted; etag cleared on device
 ERR_SEGMENT_OOB   = 0x03   # on 0x77: aborted; etag cleared on device
 ERR_PARTIAL_VERSION = 0x04 # on 0x76: client protocol version unsupported
+ERR_SEGMENT_ALIGN  = 0x05  # on 0x77: segment x/width not on an 8-pixel boundary
 
 NACK_PREFIX = 0xFF
+
+# 0x77 segment flags.
+SEGMENT_FLAG_PLANE_1 = 0x01      # PLANE_1 old-image segment when set; PLANE_0 new-image when clear
+SEGMENT_FLAG_COMPRESSED = 0x02   # Payload is one complete zlib stream when set
+SEGMENT_FLAG_RESERVED_MASK = 0xFC
 
 
 def parse_nack(response: bytes) -> tuple[int, int] | None:
@@ -49,6 +56,11 @@ SEGMENT_HEADER_SIZE = 9
 
 # Minimum region size (pixels) below which we stop recursing
 _MIN_REGION_PIXELS = 16
+
+# All segments emitted on the wire must have x and width aligned to this
+# many pixels. SSD16xx-class controllers stream 8 horizontal pixels per byte
+# and the firmware rejects misaligned segments with ERR_SEGMENT_ALIGN.
+SEGMENT_PIXEL_ALIGN = 8
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +82,7 @@ class Segment:
     height: int
     pixels: bytes          # raw palette bytes (1 byte per pixel)
     plane: int = 0         # 0 = PLANE_0 (new), 1 = PLANE_1 (old)
+    compressed: bool = False
 
     @property
     def pixel_count(self) -> int:
@@ -169,7 +182,36 @@ class RecursiveBoundingBoxStrategy:
         self._recurse(
             old, new, width, height, bytes_per_pixel,
             0, 0, width, height,          # initial region = full image
-            max_segment_bytes, segments,
+            lambda seg: len(seg.pixels) <= max_segment_bytes,
+            segments,
+        )
+        return segments
+
+    def diff_with_fit(
+        self,
+        old: bytes,
+        new: bytes,
+        width: int,
+        height: int,
+        bytes_per_pixel: int,
+        segment_fits: Callable[[Segment], bool],
+    ) -> list[Segment]:
+        """Return changed segments using a caller-defined wire-fit predicate.
+
+        This is used by the BLE upload path because actual 0x77 fit depends on
+        the display encoding and whether a zlib-compressed segment is smaller
+        than its raw wire bytes. ``segment_fits`` receives a candidate segment
+        with raw palette pixels.
+        """
+        if old == new:
+            return []
+
+        segments: list[Segment] = []
+        self._recurse(
+            old, new, width, height, bytes_per_pixel,
+            0, 0, width, height,
+            segment_fits,
+            segments,
         )
         return segments
 
@@ -249,7 +291,7 @@ class RecursiveBoundingBoxStrategy:
         ry: int,
         rw: int,
         rh: int,
-        max_segment_bytes: int,
+        segment_fits: Callable[[Segment], bool],
         out: list[Segment],
     ) -> None:
         """Recursively find changed regions within (rx, ry, rw, rh)."""
@@ -261,36 +303,54 @@ class RecursiveBoundingBoxStrategy:
             return  # no changes in this region
 
         x0, y0, x1, y1 = bb
+        # Snap x0 down and x1 up to the wire-required pixel alignment, clamped
+        # to the image width. y bounds are not constrained by the controller.
+        x0 -= x0 % SEGMENT_PIXEL_ALIGN
+        if x1 % SEGMENT_PIXEL_ALIGN:
+            x1 += SEGMENT_PIXEL_ALIGN - (x1 % SEGMENT_PIXEL_ALIGN)
+        if x1 > img_width:
+            x1 = img_width
+            # If img_width itself is not aligned, clamp x0 too so width stays aligned.
+            misalign = (x1 - x0) % SEGMENT_PIXEL_ALIGN
+            if misalign:
+                x0 = max(0, x0 - (SEGMENT_PIXEL_ALIGN - misalign))
         bw = x1 - x0
         bh = y1 - y0
         pixel_count = bw * bh
-        data_size = pixel_count * bytes_per_pixel
+        pixels = self._extract_region(new, img_width, bytes_per_pixel, x0, y0, x1, y1)
+        candidate = Segment(x=x0, y=y0, width=bw, height=bh, pixels=pixels, plane=0)
 
-        if data_size <= max_segment_bytes or pixel_count <= self._min_region_pixels:
+        if segment_fits(candidate) or pixel_count <= self._min_region_pixels:
             # Fits (or too small to split further) — emit as-is
-            pixels = self._extract_region(new, img_width, bytes_per_pixel, x0, y0, x1, y1)
-            out.append(Segment(x=x0, y=y0, width=bw, height=bh, pixels=pixels, plane=0))
+            out.append(candidate)
             return
 
         # Split along the longer axis of the bounding box
         if bw >= bh:
-            # Split vertically (along x) at midpoint of bounding box
+            # Split vertically (along x) at midpoint of bounding box, snapped
+            # to the wire alignment so the two halves don't overlap after the
+            # bounding box of each is re-aligned.
             mid = x0 + bw // 2
+            mid -= mid % SEGMENT_PIXEL_ALIGN
+            if mid <= rx or mid >= rx + rw:
+                # Region too narrow to split on an aligned boundary — emit as-is.
+                out.append(candidate)
+                return
             # Left half: region from rx to mid
             self._recurse(old, new, img_width, img_height, bytes_per_pixel,
-                          rx, ry, mid - rx, rh, max_segment_bytes, out)
+                          rx, ry, mid - rx, rh, segment_fits, out)
             # Right half: region from mid to rx+rw
             self._recurse(old, new, img_width, img_height, bytes_per_pixel,
-                          mid, ry, rx + rw - mid, rh, max_segment_bytes, out)
+                          mid, ry, rx + rw - mid, rh, segment_fits, out)
         else:
             # Split horizontally (along y) at midpoint of bounding box
             mid = y0 + bh // 2
             # Top half
             self._recurse(old, new, img_width, img_height, bytes_per_pixel,
-                          rx, ry, rw, mid - ry, max_segment_bytes, out)
+                          rx, ry, rw, mid - ry, segment_fits, out)
             # Bottom half
             self._recurse(old, new, img_width, img_height, bytes_per_pixel,
-                          rx, mid, rw, ry + rh - mid, max_segment_bytes, out)
+                          rx, mid, rw, ry + rh - mid, segment_fits, out)
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +363,15 @@ def _build_segment_wire(seg: Segment, wire_pixels: bytes) -> bytes:
     Uses *wire_pixels* rather than *seg.pixels* (which are palette bytes);
     the caller is responsible for encoding palette bytes → wire format.
 
-    Wire format per segment: x(2BE) y(2BE) w(2BE) h(2BE) flags(1) pixels(N)
+    Wire format per segment: x(2BE) y(2BE) w(2BE) h(2BE) flags(1) payload(N)
+
+    flags bit 0 selects PLANE_1 when set; flags bit 1 marks payload as one
+    complete zlib stream.
     """
-    header = struct.pack(">HHHHB", seg.x, seg.y, seg.width, seg.height, seg.plane & 0x01)
+    flags = SEGMENT_FLAG_PLANE_1 if (seg.plane & 0x01) else 0
+    if seg.compressed:
+        flags |= SEGMENT_FLAG_COMPRESSED
+    header = struct.pack(">HHHHB", seg.x, seg.y, seg.width, seg.height, flags)
     return header + wire_pixels
 
 
@@ -316,11 +382,7 @@ def pack_segments_into_packets(
 ) -> list[bytes]:
     """Pack (segment, wire_pixels) pairs into 0x77 BLE packets.
 
-    Uses space-filling (greedy largest-first) packing:
-    - Sort by wire-pixel size descending.
-    - For each packet, greedily pick the largest remaining segment that fits,
-      then continue with smaller ones until no segment fits.
-    - All input segments appear exactly once across all returned packets.
+    Preserves input order and fills packets sequentially.
 
     Args:
         segments:   List of (Segment, wire_pixels) where wire_pixels is the
@@ -338,36 +400,29 @@ def pack_segments_into_packets(
 
     # Pre-compute wire representation for each (segment, wire_pixels)
     wires: list[bytes] = [_build_segment_wire(seg, wp) for seg, wp in segments]
-    sizes: list[int] = [len(w) for w in wires]
-
-    # Sort indices by wire size descending (largest first)
-    order = sorted(range(len(wires)), key=lambda i: sizes[i], reverse=True)
-    remaining: list[int] = list(order)
     packets: list[bytes] = []
+    packet_parts: list[bytes] = []
+    space = max_payload
 
-    while remaining:
-        packet_parts: list[bytes] = []
-        space = max_payload
-        still_remaining: list[int] = []
-
-        for idx in remaining:
-            w = wires[idx]
-            if len(w) <= space:
-                packet_parts.append(w)
-                space -= len(w)
-            else:
-                still_remaining.append(idx)
-
-        if not packet_parts:
-            # Segment alone is larger than payload — emit it alone to avoid
-            # an infinite loop.  Upper layer should not produce such segments.
-            idx = remaining[0]
-            packets.append(cmd_prefix + wires[idx])
-            remaining = remaining[1:]
+    for wire in wires:
+        if len(wire) > max_payload:
+            if packet_parts:
+                packets.append(cmd_prefix + b"".join(packet_parts))
+                packet_parts = []
+                space = max_payload
+            packets.append(cmd_prefix + wire)
             continue
 
+        if len(wire) > space:
+            packets.append(cmd_prefix + b"".join(packet_parts))
+            packet_parts = []
+            space = max_payload
+
+        packet_parts.append(wire)
+        space -= len(wire)
+
+    if packet_parts:
         packets.append(cmd_prefix + b"".join(packet_parts))
-        remaining = still_remaining
 
     return packets
 

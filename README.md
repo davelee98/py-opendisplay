@@ -10,6 +10,9 @@
 
 Python library for communicating with OpenDisplay BLE e-paper displays.
 
+Partial update wire details are documented in
+[docs/partial-update-protocol.md](docs/partial-update-protocol.md).
+
 ## Installation
 
 ```bash
