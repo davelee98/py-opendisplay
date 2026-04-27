@@ -926,7 +926,7 @@ class OpenDisplayDevice:
 
         if state is not None:
             partial_outcome = await self._maybe_upload_partial(
-                processed_image, image_data, refresh_mode, state, diff_strategy
+                processed_image, image_data, refresh_mode, state, diff_strategy, progress_callback
             )
             if partial_outcome == "success":
                 _LOGGER.info("Image upload complete (partial path)")
@@ -997,7 +997,7 @@ class OpenDisplayDevice:
 
         if state is not None:
             partial_outcome = await self._maybe_upload_partial(
-                processed_image, image_data, refresh_mode, state, diff_strategy
+                processed_image, image_data, refresh_mode, state, diff_strategy, progress_callback
             )
             if partial_outcome == "success":
                 _LOGGER.info("Prepared image upload complete (partial path)")
@@ -1067,6 +1067,7 @@ class OpenDisplayDevice:
         refresh_mode: RefreshMode,
         state: PartialState,
         diff_strategy: DiffStrategy | None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> str:
         """Try to perform a partial upload. Return code:
 
@@ -1207,6 +1208,8 @@ class OpenDisplayDevice:
         validate_ack_response(response, CommandCode.DIRECT_WRITE_PARTIAL_START)
 
         # 2. 0x77 packets — ACK after each
+        total_packet_bytes = sum(len(p) - 2 for p in packets)  # exclude 2-byte command prefix
+        bytes_sent = 0
         for i, pkt in enumerate(packets):
             _LOGGER.debug("Sending partial packet %d/%d (%d bytes total)", i + 1, len(packets), len(pkt))
             await self._write(pkt)
@@ -1219,6 +1222,9 @@ class OpenDisplayDevice:
                 _LOGGER.debug("Partial packet %d NACK: opcode=0x%02x err=0x%02x", i + 1, opcode, err)
                 raise ProtocolError(f"Partial 0x77 NACK: opcode=0x{opcode:02x} err=0x{err:02x}")
             validate_ack_response(ack, CommandCode.DIRECT_WRITE_PARTIAL_DATA)
+            bytes_sent += len(pkt) - 2
+            if progress_callback is not None:
+                progress_callback(bytes_sent, total_packet_bytes)
 
         # 3. 0x72 END with new_etag
         await self._write(build_direct_write_end_with_etag(RefreshMode.PARTIAL.value, new_etag))
