@@ -7,11 +7,9 @@ import pytest
 from opendisplay.partial import (
     ERR_ETAG_MISMATCH,
     ERR_MIXED_DATA,
-    ERR_PARTIAL_VERSION,
     ERR_RECT_ALIGN,
     ERR_RECT_OOB,
     PARTIAL_FLAG_COMPRESSED,
-    PARTIAL_FLAG_STORE_ETAG,
     PartialState,
     _generate_etag,
     align_rect,
@@ -62,8 +60,7 @@ class TestParseNack:
         assert parse_nack(b"\xff\x76\x01\x00") == (0x76, ERR_ETAG_MISMATCH)
         assert parse_nack(b"\xff\x70\x02\x00") == (0x70, ERR_MIXED_DATA)
         assert parse_nack(b"\xff\x76\x03\x00") == (0x76, ERR_RECT_OOB)
-        assert parse_nack(b"\xff\x76\x04\x00") == (0x76, ERR_PARTIAL_VERSION)
-        assert parse_nack(b"\xff\x76\x05\x00") == (0x76, ERR_RECT_ALIGN)
+        assert parse_nack(b"\xff\x76\x04\x00") == (0x76, ERR_RECT_ALIGN)
 
     def test_not_nack_returns_none(self):
         assert parse_nack(b"\x00\x76") is None
@@ -138,7 +135,7 @@ class TestBuilders:
         stream = bytes(range(200))
         packet, remaining = build_direct_write_partial_start(
             old_etag=0xDEADBEEF,
-            flags=PARTIAL_FLAG_COMPRESSED | PARTIAL_FLAG_STORE_ETAG,
+            flags=PARTIAL_FLAG_COMPRESSED,
             x=8,
             y=9,
             width=16,
@@ -149,20 +146,19 @@ class TestBuilders:
 
         assert len(packet) == MAX_START_PAYLOAD
         assert packet[:2] == b"\x00\x76"
-        assert packet[2] == 1
-        assert int.from_bytes(packet[3:5], "big") == PARTIAL_FLAG_COMPRESSED | PARTIAL_FLAG_STORE_ETAG
-        assert int.from_bytes(packet[5:9], "big") == 0xDEADBEEF
-        assert int.from_bytes(packet[9:11], "big") == 8
-        assert int.from_bytes(packet[11:13], "big") == 9
-        assert int.from_bytes(packet[13:15], "big") == 16
-        assert int.from_bytes(packet[15:17], "big") == 10
-        assert int.from_bytes(packet[17:21], "little") == 40
-        assert packet[21:] == stream[:179]
-        assert remaining == stream[179:]
+        assert packet[2] == PARTIAL_FLAG_COMPRESSED
+        assert int.from_bytes(packet[3:7], "big") == 0xDEADBEEF
+        assert int.from_bytes(packet[7:9], "big") == 8
+        assert int.from_bytes(packet[9:11], "big") == 9
+        assert int.from_bytes(packet[11:13], "big") == 16
+        assert int.from_bytes(packet[13:15], "big") == 10
+        assert int.from_bytes(packet[15:18], "big") == 40
+        assert packet[18:] == stream[:182]
+        assert remaining == stream[182:]
 
-    def test_partial_start_rejects_zero_etag(self):
-        with pytest.raises(ValueError, match="old_etag"):
-            build_direct_write_partial_start(0, 0, 0, 0, 8, 1, 2)
+    def test_partial_start_allows_zero_etag(self):
+        packet, _ = build_direct_write_partial_start(0, 0, 0, 0, 8, 1, 2)
+        assert packet[3:7] == b"\x00\x00\x00\x00"
 
     def test_end_with_etag(self):
         cmd = build_direct_write_end_with_etag(refresh_mode=2, new_etag=0x01020304)

@@ -125,7 +125,7 @@ def test_valid_partial_never_sends_0x70_and_uses_uncompressed_0x76(monkeypatch):
     assert outcome == "success"
     assert 0x70 not in opcodes
     assert opcodes == [0x76, 0x72]
-    assert int.from_bytes(writes[0][3:5], "big") & PARTIAL_FLAG_COMPRESSED == 0
+    assert writes[0][2] & PARTIAL_FLAG_COMPRESSED == 0
 
 
 def test_empty_state_falls_back_to_full(monkeypatch):

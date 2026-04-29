@@ -42,7 +42,6 @@ from .models.led_flash import LedFlashConfig
 from .partial import (
     ERR_ETAG_MISMATCH,
     PARTIAL_FLAG_COMPRESSED,
-    PARTIAL_FLAG_STORE_ETAG,
     PartialState,
     _generate_etag,
     _PIXELS_PER_BYTE,
@@ -1159,7 +1158,7 @@ class OpenDisplayDevice:
         use_compression = display.supports_zip and len(compressed_stream) < len(logical_stream)
         stream_bytes = compressed_stream if use_compression else logical_stream
 
-        flags = PARTIAL_FLAG_STORE_ETAG
+        flags = 0
         if use_compression:
             flags |= PARTIAL_FLAG_COMPRESSED
 
@@ -1217,7 +1216,8 @@ class OpenDisplayDevice:
             if progress_callback is not None:
                 progress_callback(bytes_sent, total_stream_bytes)
 
-        # 3. 0x72 END with refresh_mode + new_etag (PARTIAL_FLAG_STORE_ETAG is always set)
+        # 3. 0x72 END with refresh_mode + new_etag. old_etag was non-zero,
+        # so firmware expects a replacement etag on successful refresh.
         await self._write(build_direct_write_end_with_etag(RefreshMode.PARTIAL.value, new_etag))
         response = await self._read(self.TIMEOUT_ACK)
         validate_ack_response(response, CommandCode.DIRECT_WRITE_END)

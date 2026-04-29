@@ -32,7 +32,7 @@ class CommandCode(IntEnum):
         0x0073  # Device→host: refresh finished (same code as LED_ACTIVATE, different direction)
     )
     DIRECT_WRITE_REFRESH_TIMEOUT = 0x0074  # Device→host: refresh timed out
-    DIRECT_WRITE_PARTIAL_START = 0x0076  # Start a versioned partial update transfer (stream via 0x71)
+    DIRECT_WRITE_PARTIAL_START = 0x0076  # Start a partial update transfer (stream via 0x71)
 
 
 # Protocol constants
@@ -148,35 +148,36 @@ def build_direct_write_partial_start(
     height: int,
     uncompressed_size: int,
     stream_bytes: bytes = b"",
-    version: int = 1,
 ) -> tuple[bytes, bytes]:
     """Build 0x76 partial START packet.
 
-    Fixed payload is 19 bytes; optional initial stream bytes are appended up
+    Fixed payload is 16 bytes; optional initial stream bytes are appended up
     to MAX_START_PAYLOAD total packet size (including the 2-byte command).
 
     Wire v1 fixed payload:
-      version(1) + flags(2BE) + old_etag(4BE) + x(2BE) + y(2BE) +
-      width(2BE) + height(2BE) + uncompressed_size(4LE)
+      flags(1) + old_etag(4BE) + x(2BE) + y(2BE) +
+      width(2BE) + height(2BE) + uncompressed_size(3BE)
 
     Returns:
         (start_packet, remaining_stream_bytes) — send start_packet as the
         0x76 command, then remaining_stream_bytes via 0x71 DATA chunks.
     """
-    if not 0 <= version <= 0xFF:
-        raise ValueError(f"partial protocol version out of uint8 range: {version}")
-    if not 1 <= old_etag <= 0xFFFFFFFF:
-        raise ValueError(f"old_etag must be non-zero uint32, got {old_etag}")
+    if not 0 <= flags <= 0xFF:
+        raise ValueError(f"partial flags out of uint8 range: {flags}")
+    if not 0 <= old_etag <= 0xFFFFFFFF:
+        raise ValueError(f"old_etag must be uint32, got {old_etag}")
+    if not 0 <= uncompressed_size <= 0xFFFFFF:
+        raise ValueError(f"partial uncompressed_size out of uint24 range: {uncompressed_size}")
 
     fixed = (
-        struct.pack(">BH", version, flags)
+        struct.pack(">B", flags)
         + struct.pack(">I", old_etag)
         + struct.pack(">HHHH", x, y, width, height)
-        + struct.pack("<I", uncompressed_size)
-    )  # 1+2+4+2+2+2+2+4 = 19 bytes
+        + uncompressed_size.to_bytes(3, byteorder="big")
+    )  # 1+4+2+2+2+2+3 = 16 bytes
 
     cmd = CommandCode.DIRECT_WRITE_PARTIAL_START.to_bytes(2, byteorder="big")
-    max_initial = MAX_START_PAYLOAD - 2 - len(fixed)  # 200 - 2 - 19 = 179 bytes
+    max_initial = MAX_START_PAYLOAD - 2 - len(fixed)  # 200 - 2 - 16 = 182 bytes
     initial = stream_bytes[:max_initial]
     remaining = stream_bytes[max_initial:]
     return cmd + fixed + initial, remaining

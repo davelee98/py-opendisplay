@@ -24,17 +24,16 @@ from dataclasses import dataclass
 ERR_ETAG_MISMATCH   = 0x01   # on 0x76: client must fall back to full transfer
 ERR_MIXED_DATA      = 0x02   # aborted; etag cleared on device
 ERR_RECT_OOB        = 0x03   # on 0x76: rectangle out of display bounds
-ERR_PARTIAL_VERSION = 0x04   # on 0x76: client protocol version unsupported
-ERR_RECT_ALIGN      = 0x05   # on 0x76: x or width not aligned to byte boundary
-ERR_PARTIAL_FLAGS   = 0x06   # on 0x76: unsupported or reserved flags set
-ERR_PARTIAL_SIZE    = 0x07   # on 0x76: uncompressed_size does not match geometry
-ERR_PARTIAL_STREAM  = 0x08   # on 0x71/0x72: stream byte count or content error
+ERR_RECT_ALIGN      = 0x04   # on 0x76: x or width not aligned to byte boundary
+ERR_PARTIAL_FLAGS   = 0x05   # on 0x76: unsupported or reserved flags set
+ERR_PARTIAL_SIZE    = 0x06   # on 0x76: uncompressed_size does not match geometry
+ERR_PARTIAL_STREAM  = 0x07   # on 0x71/0x72: stream byte count or content error
+ERR_PARTIAL_UNSUPPORTED = 0x08   # on 0x76: partial update unsupported for panel mode
 
 NACK_PREFIX = 0xFF
 
 # 0x76 flag bits
-PARTIAL_FLAG_COMPRESSED = 0x0004   # bit 2: stream is zlib-compressed
-PARTIAL_FLAG_STORE_ETAG = 0x0008   # bit 3: 0x72 includes new_etag; store after refresh
+PARTIAL_FLAG_COMPRESSED = 0x01   # bit 0: stream is zlib-compressed
 
 # pixels_per_byte for each bits_per_pixel value
 _PIXELS_PER_BYTE: dict[int, int] = {1: 8, 2: 4, 4: 2, 8: 1}
