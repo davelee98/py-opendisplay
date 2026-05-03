@@ -121,7 +121,13 @@ def prepare_image(
     panel_ic_type: int | None = None,
     dither_mode: DitherMode = DitherMode.BURKES,
     compress: bool = True,
-    tone_compression: float | str = "auto",
+    serpentine: bool = True,
+    exposure: float = 1.0,
+    saturation: float = 1.0,
+    shadows: float = 0.0,
+    highlights: float = 0.0,
+    tone: float | str = "auto",
+    gamut: float | str = "auto",
     fit: FitMode = FitMode.CONTAIN,
     rotate: Rotation = Rotation.ROTATE_0,
 ) -> tuple[bytes, bytes | None, Image.Image]:
@@ -141,7 +147,13 @@ def prepare_image(
             from config.
         dither_mode: Dithering algorithm to use (default: BURKES)
         compress: Whether to compress the image data (default: True)
-        tone_compression: Dynamic range compression ("auto", or 0.0-1.0)
+        serpentine: Alternate scan direction each row to reduce artifacts (default: True)
+        exposure: Exposure multiplier, >1.0 brightens (default: 1.0)
+        saturation: Saturation multiplier, >1.0 boosts (default: 1.0)
+        shadows: Shadow lift in [0.0, 1.0] (default: 0.0)
+        highlights: Highlight rolloff in [0.0, 1.0] (default: 0.0)
+        tone: Dynamic range compression — "auto", "off", or 0.0–1.0 (default: "auto")
+        gamut: Gamut compression — "auto", "off", or 0.0–1.0 (default: "auto")
         fit: How to map the image to display dimensions (default: CONTAIN)
         rotate: Source image rotation enum (0/90/180/270)
 
@@ -190,7 +202,18 @@ def prepare_image(
         )
 
     palette = get_palette_for_display(panel_ic_type, color_scheme, use_measured_palettes)
-    dithered = dither_image(image, palette, mode=dither_mode, tone_compression=tone_compression)
+    dithered = dither_image(
+        image,
+        palette,
+        mode=dither_mode,
+        serpentine=serpentine,
+        exposure=exposure,
+        saturation=saturation,
+        shadows=shadows,
+        highlights=highlights,
+        tone=tone,
+        gamut=gamut,
+    )
 
     # Encode to device format
     if color_scheme in (ColorScheme.BWR, ColorScheme.BWY):
@@ -843,7 +866,13 @@ class OpenDisplayDevice:
         image: Image.Image,
         dither_mode: DitherMode,
         compress: bool,
-        tone_compression: float | str = "auto",
+        serpentine: bool = True,
+        exposure: float = 1.0,
+        saturation: float = 1.0,
+        shadows: float = 0.0,
+        highlights: float = 0.0,
+        tone: float | str = "auto",
+        gamut: float | str = "auto",
         fit: FitMode = FitMode.CONTAIN,
         rotate: Rotation = Rotation.ROTATE_0,
     ) -> tuple[bytes, bytes | None, Image.Image]:
@@ -857,7 +886,13 @@ class OpenDisplayDevice:
             panel_ic_type=panel_ic_type,
             dither_mode=dither_mode,
             compress=compress,
-            tone_compression=tone_compression,
+            serpentine=serpentine,
+            exposure=exposure,
+            saturation=saturation,
+            shadows=shadows,
+            highlights=highlights,
+            tone=tone,
+            gamut=gamut,
             fit=fit,
             rotate=rotate,
         )
@@ -868,7 +903,13 @@ class OpenDisplayDevice:
         refresh_mode: RefreshMode = RefreshMode.FULL,
         dither_mode: DitherMode = DitherMode.BURKES,
         compress: bool = True,
-        tone_compression: float | str = "auto",
+        serpentine: bool = True,
+        exposure: float = 1.0,
+        saturation: float = 1.0,
+        shadows: float = 0.0,
+        highlights: float = 0.0,
+        tone: float | str = "auto",
+        gamut: float | str = "auto",
         fit: FitMode = FitMode.CONTAIN,
         rotate: Rotation = Rotation.ROTATE_0,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -887,7 +928,13 @@ class OpenDisplayDevice:
             refresh_mode: Display refresh mode (default: FULL)
             dither_mode: Dithering algorithm (default: BURKES)
             compress: Enable zlib compression (default: True)
-            tone_compression: Dynamic range compression ("auto" or 0.0–1.0, default: "auto").
+            serpentine: Alternate scan direction each row to reduce artifacts (default: True)
+            exposure: Exposure multiplier, >1.0 brightens (default: 1.0)
+            saturation: Saturation multiplier, >1.0 boosts (default: 1.0)
+            shadows: Shadow lift in [0.0, 1.0] (default: 0.0)
+            highlights: Highlight rolloff in [0.0, 1.0] (default: 0.0)
+            tone: Dynamic range compression — "auto", "off", or 0.0–1.0 (default: "auto")
+            gamut: Gamut compression — "auto", "off", or 0.0–1.0 (default: "auto")
             fit: How to map the image to display dimensions (default: CONTAIN).
             rotate: Source image rotation enum, applied before fit/encoding.
 
@@ -915,7 +962,18 @@ class OpenDisplayDevice:
 
         # Prepare image (fit, dither, encode, compress)
         image_data, compressed_data, processed_image = self._prepare_image(
-            image, dither_mode, compress and supports_compression, tone_compression, fit, rotate
+            image,
+            dither_mode,
+            compress and supports_compression,
+            serpentine=serpentine,
+            exposure=exposure,
+            saturation=saturation,
+            shadows=shadows,
+            highlights=highlights,
+            tone=tone,
+            gamut=gamut,
+            fit=fit,
+            rotate=rotate,
         )
         await self._dispatch_upload(image_data, refresh_mode, compress, compressed_data, progress_callback)
 
