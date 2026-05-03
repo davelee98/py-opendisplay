@@ -1008,7 +1008,8 @@ class OpenDisplayDevice:
         """
         # 1. Send START command (different for each protocol)
         if use_compression:
-            assert uncompressed_size is not None and compressed_data is not None
+            if uncompressed_size is None or compressed_data is None:
+                raise ValueError("uncompressed_size and compressed_data are required when use_compression=True")
             max_start = ENCRYPTED_CHUNK_SIZE if self._session_key is not None else MAX_START_PAYLOAD
             start_cmd, remaining_compressed = build_direct_write_start_compressed(
                 uncompressed_size, compressed_data, max_start_payload=max_start
