@@ -1166,6 +1166,8 @@ class OpenDisplayDevice:
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> str:
         """Try a partial upload using the 0x76 single-rectangle protocol."""
+        # Resolve all partial-update preconditions in one pass (support checks,
+        # state validation, diff computation, and region alignment).
         region = compute_partial_region(processed_image, state, self._config, self.color_scheme)
         if isinstance(region, str):
             return region
@@ -1182,6 +1184,8 @@ class OpenDisplayDevice:
             region.rh,
         )
 
+        # Build logical stream from the changed rectangle only, then compress
+        # when it reduces the transfer size.
         old_palette_image = region.palette_image.copy()
         old_palette_image.frombytes(region.old_palette)
         old_rect_bytes = encode_segment_wire(
@@ -1224,6 +1228,8 @@ class OpenDisplayDevice:
         new_etag = _generate_etag()
         _LOGGER.debug("Partial upload: old_etag=0x%08x new_etag=0x%08x", state.etag, new_etag)
 
+        # Start partial upload (0x76), stream remaining 0x71 chunks, and finish
+        # with partial refresh.
         start_pkt, remaining = build_direct_write_partial_start(
             old_etag=state.etag,
             new_etag=new_etag,
