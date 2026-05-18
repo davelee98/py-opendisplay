@@ -40,11 +40,11 @@ from .models.enums import BoardManufacturer, FitMode, RefreshMode, Rotation
 from .models.firmware import FirmwareVersion
 from .models.led_flash import LedFlashConfig
 from .partial import (
+    _PIXELS_PER_BYTE,
     ERR_ETAG_MISMATCH,
     PARTIAL_FLAG_COMPRESSED,
     PartialState,
     _generate_etag,
-    _PIXELS_PER_BYTE,
     align_rect,
     build_partial_logical_stream,
     compute_bounding_rect,
@@ -1167,12 +1167,7 @@ class OpenDisplayDevice:
             return "fallback_full"
 
         width, height = processed_image.size
-        if (
-            state.etag == 0
-            or state.last_image is None
-            or state.width != width
-            or state.height != height
-        ):
+        if state.etag == 0 or state.last_image is None or state.width != width or state.height != height:
             return "fallback_full"
 
         palette_image = processed_image.convert("P") if processed_image.mode != "P" else processed_image
@@ -1202,7 +1197,14 @@ class OpenDisplayDevice:
 
         _LOGGER.debug(
             "Partial path diff: old_etag=0x%08x, image=%dx%d, bbox=(%d,%d,%d,%d), rect=(%d,%d,%d,%d)",
-            state.etag, width, height, *bbox, rx, ry, rw, rh,
+            state.etag,
+            width,
+            height,
+            *bbox,
+            rx,
+            ry,
+            rw,
+            rh,
         )
 
         old_palette_image = palette_image.copy()
@@ -1224,7 +1226,13 @@ class OpenDisplayDevice:
 
         _LOGGER.debug(
             "Partial stream: rect=(%d,%d,%d,%d), uncompressed=%d, wire=%d, compressed=%s",
-            rx, ry, rw, rh, uncompressed_size, len(stream_bytes), use_compression,
+            rx,
+            ry,
+            rw,
+            rh,
+            uncompressed_size,
+            len(stream_bytes),
+            use_compression,
         )
 
         new_etag = _generate_etag()
@@ -1235,7 +1243,10 @@ class OpenDisplayDevice:
             old_etag=state.etag,
             new_etag=new_etag,
             flags=flags,
-            x=rx, y=ry, width=rw, height=rh,
+            x=rx,
+            y=ry,
+            width=rw,
+            height=rh,
             stream_bytes=stream_bytes,
         )
         await self._write(start_pkt)

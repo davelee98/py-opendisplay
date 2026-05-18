@@ -16,8 +16,8 @@ import glob
 import logging
 import sys
 import time
-from pathlib import Path
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import Any, NoReturn, TypeVar
 
 from epaper_dithering import DitherMode
@@ -160,7 +160,9 @@ async def _animate(
                 for img in images:
                     t0 = time.perf_counter()
                     prepared.append(
-                        prepare_image(img, config=device.config, capabilities=device.capabilities, dither_mode=dither_mode)
+                        prepare_image(
+                            img, config=device.config, capabilities=device.capabilities, dither_mode=dither_mode
+                        )
                     )
                     prep_times.append(time.perf_counter() - t0)
 
@@ -203,7 +205,9 @@ async def _animate(
                         send_ms = (send_end[0] - t_upload_start) * 1000
                         refresh_ms = (t_upload_end - send_end[0]) * 1000
                         kb = bytes_transferred[0] / 1024
-                        stats = f"prep {prep_ms:.0f}ms · send {send_ms:.0f}ms ({kb:.1f} KB) · refresh {refresh_ms:.0f}ms"
+                        stats = (
+                            f"prep {prep_ms:.0f}ms · send {send_ms:.0f}ms ({kb:.1f} KB) · refresh {refresh_ms:.0f}ms"
+                        )
 
                         _console.print(f"[dim]{idx + 1}/{total}  {name}  ({update_type})  {stats}[/dim]")
                         spinner_progress.update(status_task, description=_status("Showing"))
@@ -231,13 +235,15 @@ def _cmd_animate(args: argparse.Namespace) -> None:
     listing = ", ".join(names) if len(names) <= 4 else f"{names[0]}, {names[1]}, ..., {names[-1]}"
     _console.print(f"Found {len(paths)} image(s): {listing}")
 
-    _run(_animate(
-        _device_kwargs(args.device, key, args.timeout),
-        images,
-        names,
-        args.interval,
-        _DITHER_CHOICES[args.dither_mode],
-    ))
+    _run(
+        _animate(
+            _device_kwargs(args.device, key, args.timeout),
+            images,
+            names,
+            args.interval,
+            _DITHER_CHOICES[args.dither_mode],
+        )
+    )
 
 
 def main() -> None:

@@ -21,18 +21,18 @@ from dataclasses import dataclass
 # ---------------------------------------------------------------------------
 
 # NACK error codes returned by the device inside {0xFF, opcode, error, 0x00}
-ERR_ETAG_MISMATCH   = 0x01   # on 0x76: client must fall back to full transfer
-ERR_MIXED_DATA      = 0x02   # aborted; etag cleared on device
-ERR_RECT_OOB        = 0x03   # on 0x76: rectangle out of display bounds
-ERR_RECT_ALIGN      = 0x04   # on 0x76: x or width not aligned to byte boundary
-ERR_PARTIAL_FLAGS   = 0x05   # on 0x76: unsupported or reserved flags set
-ERR_PARTIAL_STREAM  = 0x06   # on 0x71/0x72: stream byte count or content error
-ERR_PARTIAL_UNSUPPORTED = 0x07   # on 0x76: partial update unsupported for panel mode
+ERR_ETAG_MISMATCH = 0x01  # on 0x76: client must fall back to full transfer
+ERR_MIXED_DATA = 0x02  # aborted; etag cleared on device
+ERR_RECT_OOB = 0x03  # on 0x76: rectangle out of display bounds
+ERR_RECT_ALIGN = 0x04  # on 0x76: x or width not aligned to byte boundary
+ERR_PARTIAL_FLAGS = 0x05  # on 0x76: unsupported or reserved flags set
+ERR_PARTIAL_STREAM = 0x06  # on 0x71/0x72: stream byte count or content error
+ERR_PARTIAL_UNSUPPORTED = 0x07  # on 0x76: partial update unsupported for panel mode
 
 NACK_PREFIX = 0xFF
 
 # 0x76 flag bits
-PARTIAL_FLAG_COMPRESSED = 0x01   # bit 0: stream is zlib-compressed
+PARTIAL_FLAG_COMPRESSED = 0x01  # bit 0: stream is zlib-compressed
 
 # pixels_per_byte for each bits_per_pixel value
 _PIXELS_PER_BYTE: dict[int, int] = {1: 8, 2: 4, 4: 2, 8: 1}
@@ -51,6 +51,7 @@ def parse_nack(response: bytes) -> tuple[int, int] | None:
 # ---------------------------------------------------------------------------
 # Bounding-rect helpers
 # ---------------------------------------------------------------------------
+
 
 def compute_bounding_rect(
     old: bytes,
@@ -123,6 +124,7 @@ def build_partial_logical_stream(
 # Etag helpers
 # ---------------------------------------------------------------------------
 
+
 def _generate_etag() -> int:
     """Generate a random non-zero 32-bit etag."""
     while True:
@@ -140,7 +142,7 @@ def _generate_etag() -> int:
 # Followed by: img_len(4BE) + img_bytes(img_len)
 _MAGIC = b"PDST"
 _VERSION = 1
-_HEADER_FMT = ">4sBIIII"   # magic(4s), version(B), etag(I BE), width(I), height(I), bpp(I)
+_HEADER_FMT = ">4sBIIII"  # magic(4s), version(B), etag(I BE), width(I), height(I), bpp(I)
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)  # 4+1+4+4+4+4 = 21 bytes
 
 
@@ -155,8 +157,8 @@ class PartialState:
     ``bytes_per_pixel`` is always 1 for library-populated instances.
     """
 
-    etag: int = 0                     # last new_etag successfully sent (0 = unknown)
-    last_image: bytes | None = None   # raw palette pixel buffer matching etag
+    etag: int = 0  # last new_etag successfully sent (0 = unknown)
+    last_image: bytes | None = None  # raw palette pixel buffer matching etag
     width: int = 0
     height: int = 0
     bytes_per_pixel: int = 0

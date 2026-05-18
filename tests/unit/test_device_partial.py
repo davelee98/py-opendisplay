@@ -144,7 +144,9 @@ def test_empty_state_falls_back_to_full(monkeypatch):
 
     monkeypatch.setattr(device, "_execute_upload", execute_upload)
 
-    asyncio.run(device.upload_prepared_image((b"\x00" * 16, None, _image()), refresh_mode=RefreshMode.PARTIAL, state=state))
+    asyncio.run(
+        device.upload_prepared_image((b"\x00" * 16, None, _image()), refresh_mode=RefreshMode.PARTIAL, state=state)
+    )
 
     assert full_uploads == 1
     assert refresh_modes == [RefreshMode.FULL]
@@ -202,7 +204,9 @@ def test_partial_request_uses_partial_even_when_full_compressed_is_smaller(monke
     monkeypatch.setattr(device, "_read", read_response)
     monkeypatch.setattr(device, "_execute_upload", fail_full_upload)
 
-    asyncio.run(device.upload_prepared_image((b"\xff" * 16, b"\x01", new), refresh_mode=RefreshMode.PARTIAL, state=state))
+    asyncio.run(
+        device.upload_prepared_image((b"\xff" * 16, b"\x01", new), refresh_mode=RefreshMode.PARTIAL, state=state)
+    )
 
     opcodes = [int.from_bytes(w[:2], "big") for w in writes]
     assert opcodes == [0x76, 0x72]

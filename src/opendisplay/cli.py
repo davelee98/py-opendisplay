@@ -8,8 +8,8 @@ import json
 import logging
 import os
 import sys
-from pathlib import Path
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import Any, NoReturn, TypeVar
 
 from epaper_dithering import DitherMode
@@ -23,7 +23,6 @@ from rich.tree import Tree
 
 from .battery import voltage_to_percent
 from .device import OpenDisplayDevice
-from .partial import PartialState
 from .discovery import discover_devices_with_adv
 from .exceptions import (
     AuthenticationFailedError,
@@ -43,6 +42,7 @@ from .models.enums import (
     SensorType,
     WifiEncryption,
 )
+from .partial import PartialState
 
 _T = TypeVar("_T")
 
