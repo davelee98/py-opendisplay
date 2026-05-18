@@ -96,7 +96,7 @@ def test_no_change_image_skips_transfer(monkeypatch):
 
     monkeypatch.setattr(device, "_write", fail_write)
 
-    outcome = asyncio.run(device._maybe_upload_partial(_image(), b"\x00" * 16, RefreshMode.PARTIAL, state, None))
+    outcome = asyncio.run(device._maybe_upload_partial(_image(), state, None))
 
     assert outcome == "no_change"
     assert state.etag == 0x01020304
@@ -119,7 +119,7 @@ def test_valid_partial_never_sends_0x70_and_uses_uncompressed_0x76(monkeypatch):
     monkeypatch.setattr(device, "_write", capture_write)
     monkeypatch.setattr(device, "_read", read_response)
 
-    outcome = asyncio.run(device._maybe_upload_partial(new, b"\x00" * 16, RefreshMode.PARTIAL, state, None))
+    outcome = asyncio.run(device._maybe_upload_partial(new, state, None))
 
     opcodes = [int.from_bytes(w[:2], "big") for w in writes]
     assert outcome == "success"

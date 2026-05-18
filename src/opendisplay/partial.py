@@ -16,6 +16,12 @@ import os
 import struct
 from dataclasses import dataclass
 
+from epaper_dithering import ColorScheme
+from PIL import Image
+
+from .encoding import encode_image
+from .models.config import DisplayConfig, GlobalConfig
+
 # ---------------------------------------------------------------------------
 # Wire constants mirrored from the firmware partial-rendering protocol.
 # ---------------------------------------------------------------------------
@@ -48,6 +54,82 @@ def parse_nack(response: bytes) -> tuple[int, int] | None:
     return None
 
 
+@dataclass
+class PartialRegion:
+    """Container for validated partial-diff metadata before upload."""
+
+    display: DisplayConfig
+    color_scheme: ColorScheme
+    width: int
+    height: int
+    palette_image: Image.Image
+    new_palette: bytes
+    old_palette: bytes
+    rx: int
+    ry: int
+    rw: int
+    rh: int
+
+
+def compute_partial_region(
+    processed_image: Image.Image,
+    state: PartialState,
+    config: GlobalConfig | None,
+    color_scheme: ColorScheme,
+) -> str | PartialRegion:
+    """Build partial-region metadata for upload diffing."""
+    if config is None or not getattr(config, "displays", None):
+        return "fallback_full"
+
+    display = config.displays[0]
+    if not display.partial_update_support:
+        return "fallback_full"
+
+    if color_scheme in (ColorScheme.BWR, ColorScheme.BWY):
+        return "fallback_full"
+
+    width, height = processed_image.size
+    if state.etag == 0 or state.last_image is None or state.width != width or state.height != height:
+        return "fallback_full"
+
+    palette_image = processed_image.convert("P") if processed_image.mode != "P" else processed_image
+    new_palette = palette_image.tobytes()
+    old_palette = state.last_image
+    if len(old_palette) != len(new_palette):
+        return "fallback_full"
+
+    bbox = compute_bounding_rect(old_palette, new_palette, width, height)
+    if bbox is None:
+        return "no_change"
+
+    bpp = {
+        ColorScheme.MONO: 1,
+        ColorScheme.BWRY: 2,
+        ColorScheme.GRAYSCALE_4: 2,
+        ColorScheme.BWGBRY: 4,
+        ColorScheme.GRAYSCALE_16: 4,
+    }.get(color_scheme, 1)
+    pixels_per_byte = _PIXELS_PER_BYTE.get(bpp, 8)
+
+    rx, ry, rw, rh = align_rect(*bbox, width, height, pixels_per_byte)
+    if rw == 0 or rh == 0:
+        return "fallback_full"
+
+    return PartialRegion(
+        display=display,
+        color_scheme=color_scheme,
+        width=width,
+        height=height,
+        palette_image=palette_image,
+        new_palette=new_palette,
+        old_palette=old_palette,
+        rx=rx,
+        ry=ry,
+        rw=rw,
+        rh=rh,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bounding-rect helpers
 # ---------------------------------------------------------------------------
@@ -68,16 +150,12 @@ def compute_bounding_rect(
         row_changed = False
         for x in range(width):
             if old[row_off + x] != new[row_off + x]:
-                if x < min_x:
-                    min_x = x
-                if x > max_x:
-                    max_x = x
+                min_x = min(min_x, x)
+                max_x = max(max_x, x)
                 row_changed = True
         if row_changed:
-            if y < min_y:
-                min_y = y
-            if y > max_y:
-                max_y = y
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
     if max_x < 0:
         return None
     return (min_x, min_y, max_x + 1, max_y + 1)
@@ -89,7 +167,7 @@ def align_rect(
     x1: int,
     y1: int,
     display_width: int,
-    display_height: int,
+    _display_height: int,
     pixels_per_byte: int,
 ) -> tuple[int, int, int, int]:
     """Expand (x0, y0, x1, y1) to packed-byte boundaries.
@@ -106,6 +184,48 @@ def align_rect(
         if misalign:
             aligned_x0 = max(0, aligned_x0 - (pixels_per_byte - misalign))
     return (aligned_x0, y0, aligned_x1 - aligned_x0, y1 - y0)
+
+
+def encode_segment_wire(
+    palette_image: Image.Image,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    color_scheme: ColorScheme,
+) -> bytes:
+    """Encode a palette rectangle to protocol wire bytes for partial updates."""
+    cropped = palette_image.crop((x, y, x + w, y + h))
+    pixels = cropped.tobytes()
+
+    if color_scheme == ColorScheme.MONO:
+        output = bytearray((len(pixels) + 7) // 8)
+        for i, palette_idx in enumerate(pixels):
+            if palette_idx > 0:
+                output[i // 8] |= 1 << (7 - (i % 8))
+        return bytes(output)
+
+    if color_scheme in (ColorScheme.BWRY, ColorScheme.GRAYSCALE_4):
+        output = bytearray((len(pixels) + 3) // 4)
+        for i, palette_idx in enumerate(pixels):
+            shift = (3 - (i % 4)) * 2
+            output[i // 4] |= (palette_idx & 0x03) << shift
+        return bytes(output)
+
+    if color_scheme in (ColorScheme.BWGBRY, ColorScheme.GRAYSCALE_16):
+        output = bytearray((len(pixels) + 1) // 2)
+        bwgbry_map = {0: 0, 1: 1, 2: 2, 3: 3, 4: 5, 5: 6}
+        for i, palette_idx in enumerate(pixels):
+            value = palette_idx & 0x0F
+            if color_scheme == ColorScheme.BWGBRY:
+                value = bwgbry_map.get(value, 0)
+            if i % 2 == 0:
+                output[i // 2] |= value << 4
+            else:
+                output[i // 2] |= value
+        return bytes(output)
+
+    return encode_image(cropped, color_scheme)
 
 
 def build_partial_logical_stream(
