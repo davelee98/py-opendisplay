@@ -9,11 +9,14 @@ from typing import Final
 class RefreshMode(IntEnum):
     """Display refresh modes.
 
-    Only FULL and FAST are supported by the firmware.
+    FULL is the normal full-screen update.
+    FAST is a panel-specific reduced-flash refresh.
+    PARTIAL requests the panel's true partial-update mode when supported.
     """
 
     FULL = 0
     FAST = 1
+    PARTIAL = 2
 
 
 class ICType(IntEnum):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 from enum import IntEnum
 
 from ..models.led_flash import LedFlashConfig
@@ -31,6 +32,7 @@ class CommandCode(IntEnum):
         0x0073  # Device→host: refresh finished (same code as LED_ACTIVATE, different direction)
     )
     DIRECT_WRITE_REFRESH_TIMEOUT = 0x0074  # Device→host: refresh timed out
+    DIRECT_WRITE_PARTIAL_START = 0x0076  # Start a partial update transfer (stream via 0x71)
 
 
 # Protocol constants
@@ -133,6 +135,50 @@ def build_direct_write_start_uncompressed() -> bytes:
     return CommandCode.DIRECT_WRITE_START.to_bytes(2, byteorder="big")
 
 
+def build_direct_write_partial_start(
+    old_etag: int,
+    new_etag: int,
+    flags: int,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    stream_bytes: bytes = b"",
+) -> tuple[bytes, bytes]:
+    """Build 0x76 partial START packet.
+
+    Fixed payload is 17 bytes; optional initial stream bytes are appended up
+    to MAX_START_PAYLOAD total packet size (including the 2-byte command).
+
+    Wire fixed payload:
+      flags(1) + old_etag(4BE) + new_etag(4BE) + x(2BE) + y(2BE) +
+      width(2BE) + height(2BE)
+
+    Returns:
+        (start_packet, remaining_stream_bytes) — send start_packet as the
+        0x76 command, then remaining_stream_bytes via 0x71 DATA chunks.
+    """
+    if not 0 <= flags <= 0xFF:
+        raise ValueError(f"partial flags out of uint8 range: {flags}")
+    if not 0 <= old_etag <= 0xFFFFFFFF:
+        raise ValueError(f"old_etag must be uint32, got {old_etag}")
+    if not 0 <= new_etag <= 0xFFFFFFFF:
+        raise ValueError(f"new_etag must be uint32, got {new_etag}")
+
+    fixed = (
+        struct.pack(">B", flags)
+        + struct.pack(">I", old_etag)
+        + struct.pack(">I", new_etag)
+        + struct.pack(">HHHH", x, y, width, height)
+    )  # 1+4+4+2+2+2+2 = 17 bytes
+
+    cmd = CommandCode.DIRECT_WRITE_PARTIAL_START.to_bytes(2, byteorder="big")
+    max_initial = MAX_START_PAYLOAD - 2 - len(fixed)  # 200 - 2 - 17 = 181 bytes
+    initial = stream_bytes[:max_initial]
+    remaining = stream_bytes[max_initial:]
+    return cmd + fixed + initial, remaining
+
+
 def build_direct_write_data_command(chunk_data: bytes) -> bytes:
     """Build command to send image data chunk.
 
@@ -173,6 +219,14 @@ def build_direct_write_end_command(refresh_mode: int = 0) -> bytes:
     cmd = CommandCode.DIRECT_WRITE_END.to_bytes(2, byteorder="big")
     refresh = refresh_mode.to_bytes(1, byteorder="big")
     return cmd + refresh
+
+
+def build_direct_write_end_with_etag(refresh_mode: int, new_etag: int) -> bytes:
+    """Build 0x72 END with a new_etag tail. Etag presence is by length only."""
+    if not 0 <= new_etag <= 0xFFFFFFFF:
+        raise ValueError(f"new_etag out of uint32 range: {new_etag}")
+    cmd = CommandCode.DIRECT_WRITE_END.to_bytes(2, byteorder="big")
+    return cmd + refresh_mode.to_bytes(1, byteorder="big") + new_etag.to_bytes(4, byteorder="big")
 
 
 def build_led_activate_command(

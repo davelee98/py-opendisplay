@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import zlib
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,7 @@ from .encoding import (
 from .exceptions import (
     AuthenticationRequiredError,
     AuthenticationSessionExistsError,
+    BLETimeoutError,
     ImageEncodingError,
     InvalidResponseError,
     ProtocolError,
@@ -37,6 +39,16 @@ from .models.config import GlobalConfig
 from .models.enums import BoardManufacturer, FitMode, RefreshMode, Rotation
 from .models.firmware import FirmwareVersion
 from .models.led_flash import LedFlashConfig
+from .partial import (
+    ERR_ETAG_MISMATCH,
+    PARTIAL_FLAG_COMPRESSED,
+    PartialState,
+    _generate_etag,
+    build_partial_logical_stream,
+    compute_partial_region,
+    encode_segment_wire,
+    parse_nack,
+)
 from .protocol import (
     CHUNK_SIZE,
     ENCRYPTED_CHUNK_SIZE,
@@ -48,6 +60,8 @@ from .protocol import (
     build_authenticate_step2,
     build_direct_write_data_command,
     build_direct_write_end_command,
+    build_direct_write_end_with_etag,
+    build_direct_write_partial_start,
     build_direct_write_start_compressed,
     build_direct_write_start_uncompressed,
     build_led_activate_command,
@@ -913,6 +927,7 @@ class OpenDisplayDevice:
         fit: FitMode = FitMode.CONTAIN,
         rotate: Rotation = Rotation.ROTATE_0,
         progress_callback: Callable[[int, int], None] | None = None,
+        state: PartialState | None = None,
     ) -> Image.Image:
         """Upload image to device display.
 
@@ -975,9 +990,32 @@ class OpenDisplayDevice:
             fit=fit,
             rotate=rotate,
         )
-        await self._dispatch_upload(image_data, refresh_mode, compress, compressed_data, progress_callback)
+
+        if state is not None:
+            partial_outcome = await self._maybe_upload_partial(processed_image, state, progress_callback)
+            if partial_outcome == "success":
+                _LOGGER.info("Image upload complete (partial path)")
+                return processed_image
+            if partial_outcome == "no_change":
+                _LOGGER.info("No pixels changed; skipping upload")
+                return processed_image
+            if partial_outcome == "fallback_full":
+                _LOGGER.info("Partial path unavailable or etag mismatch; continuing with full upload")
+
+        upload_refresh_mode = RefreshMode.FULL if state is not None else refresh_mode
+        full_upload_etag = _generate_etag() if state is not None else None
+        await self._dispatch_upload(
+            image_data,
+            upload_refresh_mode,
+            compress,
+            compressed_data,
+            progress_callback,
+            new_etag=full_upload_etag,
+        )
 
         _LOGGER.info("Image upload complete")
+        if state is not None:
+            self._update_partial_state(state, processed_image, image_data, full_upload_etag)
         return processed_image
 
     async def upload_prepared_image(
@@ -986,6 +1024,7 @@ class OpenDisplayDevice:
         refresh_mode: RefreshMode = RefreshMode.FULL,
         compress: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
+        state: PartialState | None = None,
     ) -> None:
         """Upload pre-computed image data to device.
 
@@ -1004,9 +1043,32 @@ class OpenDisplayDevice:
         Raises:
             ProtocolError: If upload fails
         """
-        image_data, compressed_data, _ = prepared_data
-        await self._dispatch_upload(image_data, refresh_mode, compress, compressed_data, progress_callback)
+        image_data, compressed_data, processed_image = prepared_data
+
+        if state is not None:
+            partial_outcome = await self._maybe_upload_partial(processed_image, state, progress_callback)
+            if partial_outcome == "success":
+                _LOGGER.info("Prepared image upload complete (partial path)")
+                return
+            if partial_outcome == "no_change":
+                _LOGGER.info("No pixels changed; skipping prepared upload")
+                return
+            if partial_outcome == "fallback_full":
+                _LOGGER.info("Partial prepared upload unavailable or etag mismatch; continuing with full upload")
+
+        upload_refresh_mode = RefreshMode.FULL if state is not None else refresh_mode
+        full_upload_etag = _generate_etag() if state is not None else None
+        await self._dispatch_upload(
+            image_data,
+            upload_refresh_mode,
+            compress,
+            compressed_data,
+            progress_callback,
+            new_etag=full_upload_etag,
+        )
         _LOGGER.info("Prepared image upload complete")
+        if state is not None:
+            self._update_partial_state(state, processed_image, image_data, full_upload_etag)
 
     async def _dispatch_upload(
         self,
@@ -1015,6 +1077,7 @@ class OpenDisplayDevice:
         compress: bool,
         compressed_data: bytes | None,
         progress_callback: Callable[[int, int], None] | None,
+        new_etag: int | None = None,
     ) -> None:
         """Choose compressed or uncompressed upload protocol and execute it."""
         display_cfg = self._config.displays[0] if (self._config and self._config.displays) else None
@@ -1031,6 +1094,7 @@ class OpenDisplayDevice:
                 compressed_data=compressed_data,
                 uncompressed_size=len(image_data),
                 progress_callback=progress_callback,
+                new_etag=new_etag,
             )
         else:
             if compress and not supports_compression:
@@ -1040,8 +1104,178 @@ class OpenDisplayDevice:
             else:
                 _LOGGER.info("Compression disabled or no compressed data, using uncompressed protocol")
             await self._execute_upload(
-                image_data, refresh_mode, use_compression=False, progress_callback=progress_callback
+                image_data,
+                refresh_mode,
+                use_compression=False,
+                progress_callback=progress_callback,
+                new_etag=new_etag,
             )
+
+    def _update_partial_state(
+        self,
+        state: PartialState,
+        processed_image: Image.Image,
+        image_data: bytes,
+        etag: int | None = None,
+    ) -> None:
+        """After a successful full upload, refresh state to reflect what's now on the panel.
+
+        Stores the etag committed to the device on 0x72 (or generates one if
+        absent), then stashes the palette pixels for diffing on the next call.
+        ``image_data`` is unused but kept for API symmetry.
+        """
+        del image_data
+        palette_image = processed_image.convert("P") if processed_image.mode != "P" else processed_image
+        state.etag = _generate_etag() if etag is None else etag
+        state.last_image = palette_image.tobytes()
+        state.width, state.height = processed_image.size
+        state.bytes_per_pixel = 1
+
+    async def _send_partial_chunks(
+        self,
+        remaining: bytes,
+        stream_bytes: bytes,
+        state: PartialState,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None:
+        """Send remaining 0x71 chunks and update upload progress."""
+        chunk_size = ENCRYPTED_CHUNK_SIZE if self._session_key is not None else CHUNK_SIZE
+        total_stream_bytes = len(stream_bytes)
+        bytes_sent = total_stream_bytes - len(remaining)
+        offset = 0
+        while offset < len(remaining):
+            chunk = remaining[offset : offset + chunk_size]
+            await self._write(build_direct_write_data_command(chunk))
+            ack = await self._read(self.TIMEOUT_ACK)
+            nack = parse_nack(ack)
+            if nack is not None:
+                opcode, err = nack
+                state.etag = 0
+                state.last_image = None
+                raise ProtocolError(f"Partial 0x71 NACK: opcode=0x{opcode:02x} err=0x{err:02x}")
+            validate_ack_response(ack, CommandCode.DIRECT_WRITE_DATA)
+            offset += len(chunk)
+            bytes_sent += len(chunk)
+            if progress_callback is not None:
+                progress_callback(bytes_sent, total_stream_bytes)
+
+    async def _maybe_upload_partial(
+        self,
+        processed_image: Image.Image,
+        state: PartialState,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> str:
+        """Try a partial upload using the 0x76 single-rectangle protocol."""
+        # Resolve all partial-update preconditions in one pass (support checks,
+        # state validation, diff computation, and region alignment).
+        region = compute_partial_region(processed_image, state, self._config, self.color_scheme)
+        if isinstance(region, str):
+            return region
+
+        display = region.display
+        _LOGGER.debug(
+            "Partial path diff: old_etag=0x%08x, image=%dx%d, rect=(%d,%d,%d,%d)",
+            state.etag,
+            region.width,
+            region.height,
+            region.rx,
+            region.ry,
+            region.rw,
+            region.rh,
+        )
+
+        # Build logical stream from the changed rectangle only, then compress
+        # when it reduces the transfer size.
+        old_palette_image = region.palette_image.copy()
+        old_palette_image.frombytes(region.old_palette)
+        old_rect_bytes = encode_segment_wire(
+            old_palette_image,
+            region.rx,
+            region.ry,
+            region.rw,
+            region.rh,
+            region.color_scheme,
+        )
+        new_rect_bytes = encode_segment_wire(
+            region.palette_image,
+            region.rx,
+            region.ry,
+            region.rw,
+            region.rh,
+            region.color_scheme,
+        )
+
+        logical_stream = build_partial_logical_stream(old_rect_bytes, new_rect_bytes)
+        compressed_stream = zlib.compress(logical_stream, level=6)
+        use_compression = display.supports_zip and len(compressed_stream) < len(logical_stream)
+        stream_bytes = compressed_stream if use_compression else logical_stream
+
+        flags = 0
+        if use_compression:
+            flags |= PARTIAL_FLAG_COMPRESSED
+
+        _LOGGER.debug(
+            "Partial stream: rect=(%d,%d,%d,%d), uncompressed=%d, wire=%d, compressed=%s",
+            region.rx,
+            region.ry,
+            region.rw,
+            region.rh,
+            len(logical_stream),
+            len(stream_bytes),
+            use_compression,
+        )
+
+        new_etag = _generate_etag()
+        _LOGGER.debug("Partial upload: old_etag=0x%08x new_etag=0x%08x", state.etag, new_etag)
+
+        # Start partial upload (0x76), stream remaining 0x71 chunks, and finish
+        # with partial refresh.
+        start_pkt, remaining = build_direct_write_partial_start(
+            old_etag=state.etag,
+            new_etag=new_etag,
+            flags=flags,
+            x=region.rx,
+            y=region.ry,
+            width=region.rw,
+            height=region.rh,
+            stream_bytes=stream_bytes,
+        )
+        await self._write(start_pkt)
+        try:
+            response = await self._read(self.TIMEOUT_ACK)
+            nack = parse_nack(response)
+            if nack is not None:
+                opcode, err = nack
+                if opcode == 0x76 and err == ERR_ETAG_MISMATCH:
+                    _LOGGER.info("Partial upload: etag mismatch; falling back to full upload")
+                    state.etag = 0
+                    state.last_image = None
+                    return "fallback_full"
+                raise ProtocolError(f"Partial 0x76 NACK: opcode=0x{opcode:02x} err=0x{err:02x}")
+            validate_ack_response(response, CommandCode.DIRECT_WRITE_PARTIAL_START)
+        except (BLETimeoutError, InvalidResponseError):
+            _LOGGER.info("Partial upload start was not acknowledged; falling back to full upload")
+            return "fallback_full"
+
+        await self._send_partial_chunks(remaining, stream_bytes, state, progress_callback)
+
+        await self._write(build_direct_write_end_command(RefreshMode.PARTIAL.value))
+        response = await self._read(self.TIMEOUT_ACK)
+        validate_ack_response(response, CommandCode.DIRECT_WRITE_END)
+
+        response = await self._read(self.TIMEOUT_REFRESH)
+        command, _ = check_response_type(response)
+        if command == CommandCode.DIRECT_WRITE_REFRESH_TIMEOUT:
+            raise ProtocolError("Display refresh timed out (device sent 0x74)")
+        if command != CommandCode.DIRECT_WRITE_REFRESH_COMPLETE:
+            raise ProtocolError(f"Unexpected response waiting for refresh: {command.name} (0x{command:04x})")
+
+        state.etag = new_etag
+        state.last_image = region.new_palette
+        state.width = region.width
+        state.height = region.height
+        state.bytes_per_pixel = 1
+        return "success"
 
     async def _execute_upload(
         self,
@@ -1051,6 +1285,7 @@ class OpenDisplayDevice:
         compressed_data: bytes | None = None,
         uncompressed_size: int | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        new_etag: int | None = None,
     ) -> None:
         """Execute image upload using compressed or uncompressed protocol.
 
@@ -1110,7 +1345,11 @@ class OpenDisplayDevice:
 
         # 4. Send END (unless device auto-triggered refresh), then wait for 0x73
         if not auto_completed:
-            end_cmd = build_direct_write_end_command(refresh_mode.value)
+            end_cmd = (
+                build_direct_write_end_with_etag(refresh_mode.value, new_etag)
+                if new_etag is not None
+                else build_direct_write_end_command(refresh_mode.value)
+            )
             await self._write(end_cmd)
 
             # Compressed END triggers decompression + full SPI write to display IC, which
