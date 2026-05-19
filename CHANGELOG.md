@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.2.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.1.0...v7.2.0) (2026-05-19)
+
+
+### Features
+
+* Add touch event parsing and TouchTracker to advertisement module ([64f1580](https://github.com/OpenDisplay/py-opendisplay/commit/64f158040431ef3d5d8015ea2c9fbcbe36f06602))
+
 ## [7.1.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.0.0...v7.1.0) (2026-05-19)
 
 
