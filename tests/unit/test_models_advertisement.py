@@ -410,6 +410,18 @@ class TestTouchTracker:
         events = tracker.update(self.ADDRESS, self._adv(1, x=10, y=10), timestamp=2.0)
         assert events == []
 
+    def test_reset_all_clears_every_address(self) -> None:
+        """reset() with no argument clears state for all tracked addresses."""
+        other = "11:22:33:44:55:66"
+        tracker = TouchTracker(instance=0, start_byte=0)
+        tracker.update(self.ADDRESS, self._adv(0), timestamp=1.0)
+        tracker.update(other, self._adv(0), timestamp=1.0)
+        tracker.reset()
+
+        # Both addresses should be treated as first advertisement → no events
+        assert tracker.update(self.ADDRESS, self._adv(1, x=5, y=5), timestamp=2.0) == []
+        assert tracker.update(other, self._adv(1, x=5, y=5), timestamp=2.0) == []
+
     def test_legacy_advertisement_returns_no_events(self) -> None:
         """Legacy advertisements (no dynamic_data) produce no touch events."""
         tracker = TouchTracker(instance=0, start_byte=0)
