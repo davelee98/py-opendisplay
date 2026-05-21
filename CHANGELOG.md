@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.2.3](https://github.com/OpenDisplay/py-opendisplay/compare/v7.2.2...v7.2.3) (2026-05-21)
+
+
+### Bug Fixes
+
+* bump epaper-dithering to 5.0.6 (fixes missing manylinux x86_64 wheels) ([d6a43b9](https://github.com/OpenDisplay/py-opendisplay/commit/d6a43b90bbe4d9ca5c153c049d7d633ae4cbede9))
+
 ## [7.2.2](https://github.com/OpenDisplay/py-opendisplay/compare/v7.2.1...v7.2.2) (2026-05-21)
 
 
