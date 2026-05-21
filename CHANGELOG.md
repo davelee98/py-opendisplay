@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.2.2](https://github.com/OpenDisplay/py-opendisplay/compare/v7.2.1...v7.2.2) (2026-05-21)
+
+
+### Bug Fixes
+
+* bump epaper-dithering to 5.0.5 (adds musllinux aarch64 wheels) ([4c6d87c](https://github.com/OpenDisplay/py-opendisplay/commit/4c6d87c3161476e081a9d95d0efd7a2ea5fa2de4))
+
 ## [7.2.1](https://github.com/OpenDisplay/py-opendisplay/compare/v7.2.0...v7.2.1) (2026-05-21)
 
 
