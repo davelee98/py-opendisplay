@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.2.1](https://github.com/OpenDisplay/py-opendisplay/compare/v7.2.0...v7.2.1) (2026-05-21)
+
+
+### Bug Fixes
+
+* bump epaper-dithering to 5.0.4 (adds musllinux x86_64 wheels) ([b298c87](https://github.com/OpenDisplay/py-opendisplay/commit/b298c8749940262b4df4ec4abbd89742fe725385))
+* remove pyrefly from runtime dependencies ([0ec0e0d](https://github.com/OpenDisplay/py-opendisplay/commit/0ec0e0d29c80b2091eea6e4cb7c5086ab74e319e))
+
 ## [7.2.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.1.0...v7.2.0) (2026-05-19)
 
 
