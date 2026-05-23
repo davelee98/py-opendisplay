@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.2.4](https://github.com/OpenDisplay/py-opendisplay/compare/v7.2.3...v7.2.4) (2026-05-23)
+
+
+### Bug Fixes
+
+* **battery:** update voltage tables for CR2450 and 2s supercap packs with PMIC ([d2f231a](https://github.com/OpenDisplay/py-opendisplay/commit/d2f231aa7d5f4bba13c0693bc5615f97300be1a3))
+* correct test voltage values and typo for new battery tables ([5971081](https://github.com/OpenDisplay/py-opendisplay/commit/59710819dbf43b9af908d217cee044bc6f3ac553))
+
 ## [7.2.3](https://github.com/OpenDisplay/py-opendisplay/compare/v7.2.2...v7.2.3) (2026-05-21)
 
 
