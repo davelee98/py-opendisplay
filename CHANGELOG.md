@@ -1,5 +1,14 @@
 # Changelog
 
+## [7.2.5](https://github.com/OpenDisplay/py-opendisplay/compare/v7.2.4...v7.2.5) (2026-05-23)
+
+
+### Bug Fixes
+
+* **ci:** drop release-please config file, use inline release-type only ([8bd98d1](https://github.com/OpenDisplay/py-opendisplay/commit/8bd98d1da9d5113c816ad2dc1bb917fffbda4fca))
+* **ci:** remove package-name from release-please config to preserve v-prefix tags ([3eac811](https://github.com/OpenDisplay/py-opendisplay/commit/3eac811de005040a64e95fe56db0356aeb3bc38d))
+* **ci:** scope uv cache key per Python version to avoid matrix race ([40aa266](https://github.com/OpenDisplay/py-opendisplay/commit/40aa26623e56405febf383153cbeff46434e5385))
+
 ## [7.2.4](https://github.com/OpenDisplay/py-opendisplay/compare/v7.2.3...v7.2.4) (2026-05-23)
 
 
