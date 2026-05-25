@@ -176,23 +176,23 @@ class TestCommandCode:
         assert CommandCode.DIRECT_WRITE_DATA == 0x0071
         assert CommandCode.DIRECT_WRITE_END == 0x0072
         assert CommandCode.LED_ACTIVATE == 0x0073
-        assert CommandCode.BUZZER_ACTIVATE == 0x0075
+        assert CommandCode.BUZZER_ACTIVATE == 0x0077
 
     def test_command_code_to_bytes(self):
         """Test command codes convert to correct big-endian bytes."""
         assert CommandCode.READ_CONFIG.to_bytes(2, "big") == b"\x00\x40"
         assert CommandCode.READ_FW_VERSION.to_bytes(2, "big") == b"\x00\x43"
         assert CommandCode.DIRECT_WRITE_START.to_bytes(2, "big") == b"\x00\x70"
-        assert CommandCode.BUZZER_ACTIVATE.to_bytes(2, "big") == b"\x00\x75"
+        assert CommandCode.BUZZER_ACTIVATE.to_bytes(2, "big") == b"\x00\x77"
 
 
 class TestBuildBuzzerActivateCommand:
     """Test build_buzzer_activate_command wire format."""
 
-    def test_command_starts_with_0x0075(self):
+    def test_command_starts_with_0x0077(self):
         config = BuzzerActivateConfig.single_tone(frequency_hz=1000, duration_ms=100)
         cmd = build_buzzer_activate_command(0, config)
-        assert cmd[:2] == b"\x00\x75"
+        assert cmd[:2] == b"\x00\x77"
 
     def test_instance_byte_at_position_2(self):
         config = BuzzerActivateConfig.single_tone(frequency_hz=1000, duration_ms=100)
