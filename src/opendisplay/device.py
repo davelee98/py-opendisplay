@@ -779,7 +779,7 @@ class OpenDisplayDevice:
         config: BuzzerActivateConfig,
         timeout: float | None = None,
     ) -> bytes:
-        """Activate buzzer via firmware command 0x0075 (firmware 1.0+).
+        """Activate buzzer via firmware command 0x0077.
 
         Args:
             buzzer_instance: Buzzer instance index (0-based)
@@ -792,17 +792,10 @@ class OpenDisplayDevice:
         Raises:
             RuntimeError: If device is not connected.
             ValueError: If command arguments are invalid.
-            ProtocolError: If firmware version is too old for this command.
             InvalidResponseError: If ACK response is malformed or mismatched.
         """
         if self._connection is None:
             raise RuntimeError("Device not connected")
-
-        fw = self._fw_version
-        if fw is None:
-            fw = await self.read_firmware_version()
-        if (fw["major"], fw["minor"]) < (1, 0):
-            raise ProtocolError(f"Buzzer activate requires firmware >= 1.0, got {fw['major']}.{fw['minor']}")
 
         cmd = build_buzzer_activate_command(buzzer_instance=buzzer_instance, config=config)
         await self._write(cmd)
