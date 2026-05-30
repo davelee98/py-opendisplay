@@ -447,7 +447,7 @@ async def test_execute_upload_raises_on_unexpected_refresh_response() -> None:
 
 
 def test_display_config_supports_raw_aliases_supports_zipxl() -> None:
-    """supports_raw is an alias for supports_zipxl (bit 0x01)."""
+    """supports_raw is a legacy alias for supports_zipxl (bit 0x01)."""
     config = _make_config(transmission_modes=0x01)
     display_cfg = config.displays[0]
     assert display_cfg.supports_zipxl is True

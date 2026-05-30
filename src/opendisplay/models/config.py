@@ -269,7 +269,7 @@ class DisplayConfig:
 
     @property
     def supports_raw(self) -> bool:
-        """Alias for supports_zipxl (bit 0x01 was previously named TRANSMISSION_MODE_RAW)."""
+        """Legacy alias for supports_zipxl (bit 0x01 was previously named TRANSMISSION_MODE_RAW)."""
         return self.supports_zipxl
 
     @property
