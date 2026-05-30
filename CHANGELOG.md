@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.4.1](https://github.com/OpenDisplay/py-opendisplay/compare/v7.4.0...v7.4.1) (2026-05-30)
+
+
+### Bug Fixes
+
+* Allow uncompressed transport for 4-gray uploads ([d3470c6](https://github.com/OpenDisplay/py-opendisplay/commit/d3470c6d9033ad3e0e9f940919fa6e7739f62930))
+* serialize_display_config dropping full_update_mC ([09bbc0e](https://github.com/OpenDisplay/py-opendisplay/commit/09bbc0e87feee8fb443968789a9666f174eb718f))
+
 ## [7.4.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.3.2...v7.4.0) (2026-05-29)
 
 
