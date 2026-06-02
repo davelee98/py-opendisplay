@@ -166,6 +166,13 @@ class WifiEncryption(IntEnum):
     WPA3 = 4
 
 
+class BinaryInputType(IntEnum):
+    """Binary input acquisition methods (BinaryInputs.input_type)."""
+
+    DIGITAL = 1  # one GPIO per button, digitalRead + edge interrupt
+    ADC_LADDER = 2  # buttons share one ADC pin, distinguished by voltage (polled)
+
+
 MANUFACTURER_NAMES: Final[dict[BoardManufacturer, str]] = {
     BoardManufacturer.DIY: "DIY",
     BoardManufacturer.SEEED: "Seeed Studio",
