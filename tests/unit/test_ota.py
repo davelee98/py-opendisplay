@@ -1,4 +1,10 @@
-"""Tests for OTA firmware update utilities."""
+"""Tests for OTA firmware update utilities.
+
+The Silabs and nRF OTA *protocols* live in their own libraries
+(``silabs-ble-ota`` / ``nrf-ota``) and are tested there. Here we only cover the
+py-opendisplay-side glue: ``find_nrf_dfu_device`` and the lazy-import guards in
+the ``perform_*`` wrappers.
+"""
 
 from __future__ import annotations
 
@@ -7,147 +13,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from opendisplay.exceptions import OTAError
-from opendisplay.ota import (
-    _SILABS_OTA_CHUNK_SIZE,
-    _SILABS_OTA_CONTROL_UUID,
-    _SILABS_OTA_DATA_UUID,
-    find_nrf_dfu_device,
-    perform_silabs_ota,
-)
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_bleak_client(char_uuids: list[str]) -> MagicMock:
-    """Return a mock BleakClient whose services expose the given char UUIDs."""
-    char_mocks = [MagicMock(uuid=uuid) for uuid in char_uuids]
-    svc = MagicMock()
-    svc.characteristics = char_mocks
-    client = AsyncMock()
-    client.services = [svc]
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
-    return client
+from opendisplay.ota import find_nrf_dfu_device
 
 
 def _make_ble_device(address: str = "AA:BB:CC:DD:EE:FF") -> MagicMock:
     dev = MagicMock()
     dev.address = address
     return dev
-
-
-# ---------------------------------------------------------------------------
-# perform_silabs_ota
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_silabs_ota_happy_path() -> None:
-    """Full OTA transfer: start write, all data chunks, finalize write."""
-    gbl = bytes(range(256)) * 2  # 512 bytes → 3 chunks of 244/244/24
-    client = _make_bleak_client([_SILABS_OTA_CONTROL_UUID, _SILABS_OTA_DATA_UUID])
-    progress: list[float] = []
-
-    with (
-        patch("opendisplay.ota.asyncio.sleep", new=AsyncMock()),
-        patch("bleak.BleakClient", return_value=client),
-    ):
-        await perform_silabs_ota(gbl, _make_ble_device(), on_progress=progress.append)
-
-    calls = client.write_gatt_char.call_args_list
-    # First call: OTA start (0x00)
-    assert calls[0].args[0] == _SILABS_OTA_CONTROL_UUID
-    assert calls[0].args[1] == bytearray([0x00])
-    assert calls[0].kwargs["response"] is True
-
-    # Middle calls: data chunks
-    data_calls = [c for c in calls if c.args[0] == _SILABS_OTA_DATA_UUID]
-    total_sent = sum(len(c.args[1]) for c in data_calls)
-    assert total_sent == len(gbl)
-    assert all(len(c.args[1]) <= _SILABS_OTA_CHUNK_SIZE for c in data_calls)
-    assert all(c.kwargs["response"] is False for c in data_calls)
-
-    # Last call: OTA finalize (0x03)
-    assert calls[-1].args[0] == _SILABS_OTA_CONTROL_UUID
-    assert calls[-1].args[1] == bytearray([0x03])
-    assert calls[-1].kwargs["response"] is True
-
-    # Progress goes from > 0 to 100
-    assert progress[0] > 0
-    assert progress[-1] == pytest.approx(100.0)
-
-
-@pytest.mark.asyncio
-async def test_silabs_ota_sleeps_before_connect() -> None:
-    """perform_silabs_ota waits for AppLoader to boot before connecting."""
-    sleep_mock = AsyncMock()
-    client = _make_bleak_client([_SILABS_OTA_CONTROL_UUID, _SILABS_OTA_DATA_UUID])
-
-    with (
-        patch("opendisplay.ota.asyncio.sleep", new=sleep_mock),
-        patch("bleak.BleakClient", return_value=client),
-    ):
-        await perform_silabs_ota(b"\x00" * 10, _make_ble_device())
-
-    sleep_mock.assert_awaited_once_with(6.0)
-
-
-@pytest.mark.asyncio
-async def test_silabs_ota_missing_control_char_raises() -> None:
-    """OTAError when the AppLoader OTA control characteristic is absent."""
-    client = _make_bleak_client(["some-other-uuid"])
-
-    with (
-        patch("opendisplay.ota.asyncio.sleep", new=AsyncMock()),
-        patch("bleak.BleakClient", return_value=client),
-    ):
-        with pytest.raises(OTAError, match="not in Silabs OTA mode"):
-            await perform_silabs_ota(b"\x00" * 10, _make_ble_device())
-
-
-@pytest.mark.asyncio
-async def test_silabs_ota_connection_error_wrapped() -> None:
-    """Non-OTA exceptions from BleakClient are wrapped in OTAError."""
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(side_effect=RuntimeError("connection refused"))
-    client.__aexit__ = AsyncMock(return_value=False)
-
-    with (
-        patch("opendisplay.ota.asyncio.sleep", new=AsyncMock()),
-        patch("bleak.BleakClient", return_value=client),
-    ):
-        with pytest.raises(OTAError, match="Silabs OTA failed"):
-            await perform_silabs_ota(b"\x00" * 10, _make_ble_device())
-
-
-@pytest.mark.asyncio
-async def test_silabs_ota_no_progress_callback() -> None:
-    """perform_silabs_ota works without an on_progress callback."""
-    client = _make_bleak_client([_SILABS_OTA_CONTROL_UUID, _SILABS_OTA_DATA_UUID])
-
-    with (
-        patch("opendisplay.ota.asyncio.sleep", new=AsyncMock()),
-        patch("bleak.BleakClient", return_value=client),
-    ):
-        await perform_silabs_ota(b"\x00" * 10, _make_ble_device(), on_progress=None)
-
-
-@pytest.mark.asyncio
-async def test_silabs_ota_log_callback() -> None:
-    """on_log receives status messages during the transfer."""
-    client = _make_bleak_client([_SILABS_OTA_CONTROL_UUID, _SILABS_OTA_DATA_UUID])
-    logs: list[str] = []
-
-    with (
-        patch("opendisplay.ota.asyncio.sleep", new=AsyncMock()),
-        patch("bleak.BleakClient", return_value=client),
-    ):
-        await perform_silabs_ota(b"\x00" * 10, _make_ble_device(), on_log=logs.append)
-
-    assert any("AppLoader" in msg for msg in logs)
-    assert any("complete" in msg.lower() for msg in logs)
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +100,7 @@ async def test_find_nrf_dfu_device_mac_plus1_wraps_ff() -> None:
 
 
 # ---------------------------------------------------------------------------
-# perform_nrf_dfu — import guard
+# perform_* wrappers — optional-dependency import guards
 # ---------------------------------------------------------------------------
 
 
@@ -246,3 +118,137 @@ async def test_nrf_dfu_missing_dependency_raises() -> None:
     with patch.dict("sys.modules", blocked):
         with pytest.raises(OTAError, match="nrf-ota is required"):
             await perform_nrf_dfu(b"", _make_ble_device())
+
+
+@pytest.mark.asyncio
+async def test_silabs_ota_missing_dependency_raises() -> None:
+    """OTAError with install hint when silabs-ble-ota is not installed."""
+    from opendisplay.ota import perform_silabs_ota
+
+    with patch.dict("sys.modules", {"silabs_ble_ota": None}):
+        with pytest.raises(OTAError, match="silabs-ble-ota is required"):
+            await perform_silabs_ota(b"", _make_ble_device())
+
+
+# ---------------------------------------------------------------------------
+# perform_silabs_ota — delegates to silabs-ble-ota, maps its error
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_silabs_ota_delegates_and_maps_errors() -> None:
+    """The wrapper forwards (incl. fast=) to silabs_ble_ota and maps SilabsOTAError → OTAError."""
+    import types
+
+    from opendisplay.ota import perform_silabs_ota
+
+    fake = types.ModuleType("silabs_ble_ota")
+
+    class _SilabsOTAError(Exception):
+        pass
+
+    seen: dict[str, object] = {}
+
+    async def _flash(gbl, dev, on_progress, on_log, *, fast):  # noqa: ANN001
+        seen["call"] = (gbl, dev, fast)
+
+    fake.SilabsOTAError = _SilabsOTAError  # type: ignore[attr-defined]
+    fake.perform_silabs_ota = _flash  # type: ignore[attr-defined]
+
+    dev = _make_ble_device()
+    with patch.dict("sys.modules", {"silabs_ble_ota": fake}):
+        await perform_silabs_ota(b"GBL", dev, fast=True)
+        assert seen["call"] == (b"GBL", dev, True)
+
+        async def _flash_fail(*_a, **_k):
+            raise _SilabsOTAError("boom")
+
+        fake.perform_silabs_ota = _flash_fail  # type: ignore[attr-defined]
+        with pytest.raises(OTAError, match="boom"):
+            await perform_silabs_ota(b"", _make_ble_device())
+
+
+# ---------------------------------------------------------------------------
+# perform_nrf_dfu — connect (via establish_connection) + LegacyDFU orchestration
+# ---------------------------------------------------------------------------
+
+
+def _make_dfu_client(service_uuid: str = "00001530-1212-efde-1523-785feabcd123") -> AsyncMock:
+    """A connected DFU client exposing the Legacy DFU service UUID."""
+    client = AsyncMock()
+    svc = MagicMock()
+    svc.uuid = service_uuid
+    client.services = [svc]
+    return client
+
+
+@pytest.mark.asyncio
+async def test_perform_nrf_dfu_happy_path() -> None:
+    """Connects, runs the full LegacyDFU sequence, and disconnects."""
+    from opendisplay.ota import perform_nrf_dfu
+
+    client = _make_dfu_client()
+    dfu = AsyncMock()
+    dfu.read_version = AsyncMock(return_value=(0, 8))
+    zip_info = MagicMock(firmware=b"\x00" * 100, init_packet=b"\x01\x02")
+
+    with (
+        patch("bleak_retry_connector.establish_connection", new=AsyncMock(return_value=client)),
+        patch("nrf_ota.dfu.LegacyDFU", return_value=dfu),
+        patch("nrf_ota._zip._parse_zip_bytes", return_value=zip_info),
+    ):
+        await perform_nrf_dfu(b"zip", _make_ble_device())
+
+    dfu.start.assert_awaited_once()
+    dfu.start_dfu.assert_awaited_once()
+    dfu.init_dfu.assert_awaited_once()
+    dfu.send_firmware.assert_awaited_once()
+    dfu.activate_and_reset.assert_awaited_once()
+    client.disconnect.assert_awaited()
+    # default (not fast) paces the firmware stream
+    assert dfu.send_firmware.await_args.kwargs["inter_packet_delay"] > 0
+
+
+@pytest.mark.asyncio
+async def test_perform_nrf_dfu_fast_sends_unpaced() -> None:
+    """fast=True streams with no inter-packet delay."""
+    from opendisplay.ota import perform_nrf_dfu
+
+    client = _make_dfu_client()
+    dfu = AsyncMock()
+    dfu.read_version = AsyncMock(return_value=(0, 8))
+    with (
+        patch("bleak_retry_connector.establish_connection", new=AsyncMock(return_value=client)),
+        patch("nrf_ota.dfu.LegacyDFU", return_value=dfu),
+        patch("nrf_ota._zip._parse_zip_bytes", return_value=MagicMock(firmware=b"x" * 40, init_packet=b"i")),
+    ):
+        await perform_nrf_dfu(b"zip", _make_ble_device(), fast=True)
+    assert dfu.send_firmware.await_args.kwargs["inter_packet_delay"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_perform_nrf_dfu_not_in_dfu_mode_raises() -> None:
+    """A device without the Legacy DFU service raises OTAError and still disconnects."""
+    from opendisplay.ota import perform_nrf_dfu
+
+    client = _make_dfu_client(service_uuid="0000abcd-0000-1000-8000-00805f9b34fb")
+    with (
+        patch("bleak_retry_connector.establish_connection", new=AsyncMock(return_value=client)),
+        patch("nrf_ota._zip._parse_zip_bytes", return_value=MagicMock(firmware=b"x", init_packet=b"i")),
+    ):
+        with pytest.raises(OTAError, match="not in Nordic Legacy DFU mode"):
+            await perform_nrf_dfu(b"zip", _make_ble_device())
+    client.disconnect.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_perform_nrf_dfu_connect_failure_raises() -> None:
+    """A failed connection is wrapped in OTAError."""
+    from opendisplay.ota import perform_nrf_dfu
+
+    with (
+        patch("bleak_retry_connector.establish_connection", new=AsyncMock(side_effect=RuntimeError("nope"))),
+        patch("nrf_ota._zip._parse_zip_bytes", return_value=MagicMock(firmware=b"x", init_packet=b"i")),
+    ):
+        with pytest.raises(OTAError, match="Could not connect to nRF DFU bootloader"):
+            await perform_nrf_dfu(b"zip", _make_ble_device())

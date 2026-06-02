@@ -11,16 +11,14 @@ from .exceptions import OTAError
 if TYPE_CHECKING:
     from bleak.backends.device import BLEDevice
 
-_SILABS_OTA_CONTROL_UUID = "f7bf3564-fb6d-4e53-88a4-5e37e0326063"
-_SILABS_OTA_DATA_UUID = "984227f3-34fc-4045-a5d0-2c581f81a153"
-_SILABS_OTA_CHUNK_SIZE = 244
-
 
 async def perform_nrf_dfu(
     zip_bytes: bytes,
     dfu_ble_device: BLEDevice,
     on_progress: Callable[[float], None] | None = None,
     on_log: Callable[[str], None] | None = None,
+    *,
+    fast: bool = False,
 ) -> None:
     """Flash an nRF device that is already in Nordic Legacy DFU mode.
 
@@ -34,12 +32,17 @@ async def perform_nrf_dfu(
         dfu_ble_device: BLE device already in DFU mode.
         on_progress: Optional callback with float percentage 0–100.
         on_log: Optional callback for human-readable status messages.
+        fast: Stream firmware packets unpaced for a much faster transfer. Only
+            safe on a direct connection — over an ESPHome Bluetooth proxy the
+            unpaced write-without-response burst is silently dropped and the DFU
+            stalls. Leave ``False`` (paced) when flashing through a proxy, which
+            is always the case on HA OS. Defaults to ``False``.
 
     Raises:
         OTAError: DFU transfer failed or DFU service not present.
     """
     try:
-        from bleak import BleakClient
+        from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
         from nrf_ota._const import DEFAULT_PRN, LEGACY_DFU_SERVICE_UUID, TYPE_APPLICATION
         from nrf_ota._zip import _parse_zip_bytes
         from nrf_ota.dfu import LegacyDFU
@@ -49,32 +52,66 @@ async def perform_nrf_dfu(
     log = on_log or (lambda _: None)
     zip_info = _parse_zip_bytes(zip_bytes)
 
+    # Connect through bleak-retry-connector so the DFU transfer works over an
+    # ESPHome Bluetooth proxy too — a plain BleakClient only connects via a local
+    # adapter, which is why this previously failed on HA OS but worked on a dev
+    # Mac. use_services_cache=False forces a fresh GATT discovery: the DFU
+    # bootloader exposes a different service table than the application.
     try:
-        async with BleakClient(dfu_ble_device) as client:
-            svc_uuids = [str(s.uuid).lower() for s in client.services]
-            log(f"DFU device services: {svc_uuids}")
+        client = await establish_connection(
+            BleakClientWithServiceCache,
+            dfu_ble_device,
+            dfu_ble_device.name or "nRF DFU",
+            use_services_cache=False,
+            max_attempts=4,
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced as OTAError
+        raise OTAError(f"Could not connect to nRF DFU bootloader: {exc}") from exc
 
-            if not any(s == LEGACY_DFU_SERVICE_UUID.lower() for s in svc_uuids):
-                raise OTAError(f"Device is not in Nordic Legacy DFU mode. Services found: {svc_uuids}")
+    try:
+        svc_uuids = [str(s.uuid).lower() for s in client.services]
+        log(f"DFU device services: {svc_uuids}")
 
-            dfu = LegacyDFU(client, on_progress=on_progress, on_log=log)
-            try:
-                major, minor = await dfu.read_version()
-                log(f"DFU bootloader version: {major}.{minor}")
-            except Exception:  # noqa: BLE001
-                log("Warning: could not read DFU version")
+        if not any(s == LEGACY_DFU_SERVICE_UUID.lower() for s in svc_uuids):
+            raise OTAError(f"Device is not in Nordic Legacy DFU mode. Services found: {svc_uuids}")
 
-            await dfu.start()
-            await dfu.start_dfu(len(zip_info.firmware), TYPE_APPLICATION)
-            await dfu.init_dfu(zip_info.init_packet)
-            await dfu.send_firmware(zip_info.firmware, packets_per_notification=DEFAULT_PRN)
-            await dfu.activate_and_reset()
-            log("DFU complete — device is rebooting with new firmware.")
+        dfu = LegacyDFU(client, on_progress=on_progress, on_log=log)
+        try:
+            major, minor = await dfu.read_version()
+            log(f"DFU bootloader version: {major}.{minor}")
+        except Exception:  # noqa: BLE001
+            log("Warning: could not read DFU version")
+
+        # Over a Bluetooth proxy the DFU Packet characteristic (write-without-
+        # response) is dropped if it overruns the proxy's buffer, and Legacy DFU
+        # can't retransmit, so a single drop fails the whole 11.7k-packet transfer.
+        # 0.01/0.02s both dropped intermittently; 0.05s gives the proxy far more
+        # drain time per packet (~8-10min) to test whether the drops are
+        # pacing-sensitive buffer overruns. A direct connection has real flow
+        # control, so fast mode sends unpaced.
+        inter_packet_delay = 0.0 if fast else 0.05
+        await dfu.start()
+        await dfu.start_dfu(len(zip_info.firmware), TYPE_APPLICATION)
+        await dfu.init_dfu(zip_info.init_packet)
+        await dfu.send_firmware(
+            zip_info.firmware,
+            packets_per_notification=DEFAULT_PRN,
+            inter_packet_delay=inter_packet_delay,
+        )
+        await dfu.activate_and_reset()
+        log("DFU complete — device is rebooting with new firmware.")
 
     except OTAError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - surfaced as OTAError
         raise OTAError(f"nRF DFU failed: {exc}") from exc
+    finally:
+        # The device reboots out of DFU on activate/disconnect anyway; disconnect
+        # explicitly so we don't leak the connection if the transfer raised.
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
 
 
 async def perform_silabs_ota(
@@ -82,62 +119,45 @@ async def perform_silabs_ota(
     ble_device: BLEDevice,
     on_progress: Callable[[float], None] | None = None,
     on_log: Callable[[str], None] | None = None,
+    *,
+    fast: bool = False,
 ) -> None:
-    """Flash an EFR32BG22 device using Silicon Labs AppLoader OTA.
+    """Flash an EFR32 device in the Silicon Labs AppLoader (delegates to silabs-ble-ota).
 
-    Call ``OpenDisplayDevice.trigger_dfu_bootloader()`` first. This function
-    retries the connection for up to 20 s waiting for the AppLoader to boot —
-    no external sleep is required before calling.
+    Thin wrapper over the standalone :mod:`silabs_ble_ota` library (an optional
+    dependency, installed via the ``silabs-ota`` extra), mirroring how
+    :func:`perform_nrf_dfu` wraps ``nrf-ota``.
 
-    The AppLoader exits back to the application when the BLE connection
-    drops, so the full transfer must complete in a single connection.
+    Call ``OpenDisplayDevice.trigger_dfu_bootloader()`` first, then pass the
+    AppLoader's ``BLEDevice`` (same address as app mode). Over an ESPHome
+    Bluetooth proxy, clear the proxy's stale per-MAC GATT cache first via
+    ``OpenDisplayDevice.clear_gatt_cache()`` so this connection re-discovers the
+    AppLoader's OTA service instead of the cached app-firmware table.
 
     Args:
         gbl_bytes: Raw .gbl firmware file bytes.
-        ble_device: BLE device (same address as app mode).
+        ble_device: BLE device in (or booting into) the AppLoader.
         on_progress: Optional callback with float percentage 0–100.
         on_log: Optional callback for human-readable status messages.
+        fast: Use the faster write-without-response transfer. Only safe on a
+            direct connection (no Bluetooth proxy). Leave ``False`` when flashing
+            through an ESPHome Bluetooth proxy. Defaults to ``False``.
 
     Raises:
-        OTAError: OTA transfer failed or AppLoader did not appear within 20 s.
+        OTAError: silabs-ble-ota is not installed, or the OTA failed.
     """
-    from bleak import BleakClient
-
-    log = on_log or (lambda _: None)
-    file_size = len(gbl_bytes)
-
-    # Brief pause to let the device finish rebooting into AppLoader before we
-    # attempt a connection. The AppLoader waits indefinitely once running.
-    log("Waiting for AppLoader to boot…")
-    await asyncio.sleep(6.0)
+    try:
+        from silabs_ble_ota import SilabsOTAError
+        from silabs_ble_ota import perform_silabs_ota as _perform_silabs_ota
+    except ImportError as exc:
+        raise OTAError(
+            "silabs-ble-ota is required for Silabs firmware updates; install it with: pip install silabs-ble-ota"
+        ) from exc
 
     try:
-        async with BleakClient(ble_device, timeout=20.0) as client:
-            char_uuids = {str(c.uuid).lower() for svc in client.services for c in svc.characteristics}
-            if _SILABS_OTA_CONTROL_UUID not in char_uuids:
-                raise OTAError(
-                    "Device is not in Silabs OTA mode — AppLoader characteristic not found after GATT rediscovery"
-                )
-
-            log("Connected to AppLoader. Starting OTA transfer…")
-            await client.write_gatt_char(_SILABS_OTA_CONTROL_UUID, bytearray([0x00]), response=True)
-
-            sent = 0
-            while sent < file_size:
-                chunk = gbl_bytes[sent : sent + _SILABS_OTA_CHUNK_SIZE]
-                await client.write_gatt_char(_SILABS_OTA_DATA_UUID, chunk, response=False)
-                sent += len(chunk)
-                if on_progress:
-                    on_progress(sent / file_size * 100)
-
-            log("Stream complete. Finalizing…")
-            await client.write_gatt_char(_SILABS_OTA_CONTROL_UUID, bytearray([0x03]), response=True)
-            log("OTA complete — device is verifying and rebooting.")
-
-    except OTAError:
-        raise
-    except Exception as exc:
-        raise OTAError(f"Silabs OTA failed: {exc}") from exc
+        await _perform_silabs_ota(gbl_bytes, ble_device, on_progress, on_log, fast=fast)
+    except SilabsOTAError as exc:
+        raise OTAError(str(exc)) from exc
 
 
 async def find_nrf_dfu_device(original_address: str) -> BLEDevice | None:

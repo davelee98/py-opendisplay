@@ -742,12 +742,50 @@ class OpenDisplayDevice:
         Raises:
             BLEConnectionError: If the command cannot be sent
         """
+        from .exceptions import BLEConnectionError
+
         _LOGGER.debug("Triggering DFU bootloader on device %s", self.mac_address)
-        await self._write(build_enter_dfu_command())
+        try:
+            await self._write(build_enter_dfu_command())
+        except BLEConnectionError as exc:
+            # The firmware resets before it can ACK this command — it has no time
+            # to send a write response — so the confirmation never arrives. With a
+            # write-with-response transport, especially over a Bluetooth proxy,
+            # that surfaces as a GATT/disconnect error (e.g. error 133) even though
+            # the command was delivered and the device is already entering DFU.
+            # Treat a write failure here as expected rather than fatal; whether the
+            # device actually entered DFU is determined by the subsequent scan for
+            # the DFU-mode device.
+            _LOGGER.debug(
+                "DFU trigger write did not ACK (expected — device resets before responding): %s",
+                exc,
+            )
         _LOGGER.info(
             "DFU bootloader trigger sent to %s — device will disconnect and enter DFU mode",
             self.mac_address,
         )
+
+    async def clear_gatt_cache(self) -> bool:
+        """Clear the cached GATT table for this device on the active connection.
+
+        Use this on the Silabs (EFR32BG22) OTA path *before* calling
+        ``trigger_dfu_bootloader()``, while still connected in app mode: it
+        clears an ESPHome Bluetooth proxy's stale per-MAC GATT cache so that the
+        post-reboot connection to the AppLoader re-discovers the OTA service
+        instead of returning the cached app-firmware table. The device keeps the
+        same address across the reboot, so without this the proxy would serve
+        the wrong GATT and the OTA characteristics would not be found.
+
+        No-op (returns False) on backends without cache support (e.g. direct
+        BlueZ on a bleak build lacking ``clear_cache``).
+
+        Returns:
+            True if a cache was cleared, False if unsupported by the backend.
+
+        Raises:
+            BLEConnectionError: If the device is not connected.
+        """
+        return await self._conn.clear_cache()
 
     async def activate_led(
         self,

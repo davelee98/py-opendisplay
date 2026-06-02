@@ -43,7 +43,10 @@ cli = [
     "rich>=13.0.0",
 ]
 nrf-ota = [
-    "nrf-ota>=0.3.0",
+    "nrf-ota>=0.4.0",
+]
+silabs-ota = [
+    "silabs-ble-ota>=0.1.0",
 ]
 test = [
     "pytest>=9.0.2",
@@ -78,7 +81,7 @@ warn_return_any = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["nrf_ota.*"]
+module = ["nrf_ota.*", "silabs_ble_ota.*"]
 ignore_missing_imports = true
 
 [tool.pylint.format]
