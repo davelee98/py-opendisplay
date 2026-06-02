@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.5.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.4.1...v7.5.0) (2026-06-02)
+
+
+### Features
+
+* BLE OTA firmware updates over Bluetooth proxies ([71c9062](https://github.com/OpenDisplay/py-opendisplay/commit/71c90627f7908a62e62184196c139f58b6eb8cb5))
+
 ## [7.4.1](https://github.com/OpenDisplay/py-opendisplay/compare/v7.4.0...v7.4.1) (2026-05-30)
 
 
