@@ -33,6 +33,29 @@ jobs:
         with:
           release-type: python
 
+      # release-please bumps the version in pyproject.toml but does not refresh
+      # uv.lock (which records the project's own version). Left stale, every
+      # later `uv run` rewrites uv.lock and dirties the tree / blocks commits.
+      # Regenerate it on the release PR branch so the bump and lockfile land
+      # together. Idempotent: re-runs each time release-please updates the PR.
+      - if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: actions/checkout@v6
+        with:
+          ref: release-please--branches--${{ github.ref_name }}
+      - if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: astral-sh/setup-uv@v8.1.0
+      - if: ${{ steps.release.outputs.prs_created == 'true' }}
+        name: Sync uv.lock on the release PR
+        run: |
+          uv lock
+          if ! git diff --quiet -- uv.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add uv.lock
+            git commit -m "chore: sync uv.lock with release version"
+            git push origin HEAD:release-please--branches--${{ github.ref_name }}
+          fi
+
   publish:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true' || inputs.tag != ''
