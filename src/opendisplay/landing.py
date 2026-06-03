@@ -5,12 +5,12 @@ A landing URL points the user at the per-device config page and has the form:
     https://opendisplay.org/l/?<base64url(payload)>
 
 ``payload`` is a fixed 23-byte, big-endian identity blob -- the same bytes the
-firmware renders as an on-screen QR code (see Firmwares/*/boot_screen.*). The
-web page at /l/ base64url-decodes the query string back into these fields:
+firmware renders as an on-screen QR code. The web page at /l/ base64url-decodes
+the query string back into these fields:
 
     offset  size  field            notes
     0       2     tag_type         u16, BE (DisplayConfig.tag_type; 0 if none)
-    2       3     device id        low 3 bytes of the MAC == the "OD######" name
+    2       3     device id        the device's unique id == the "OD######" name
     5       16    AES key          encryption key, or all-zero if unknown
     21      2     manufacturer_id  u16, BE (OpenDisplay enum 0..4, NOT BLE 9286)
 
