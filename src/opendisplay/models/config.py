@@ -547,7 +547,7 @@ class BinaryInputs:
         thresholds: list[int],
         display_as: int = 0,
     ) -> BinaryInputs:
-        """Build an ADC resistor-ladder input (input_type=2).
+        """Build an ADC resistor-ladder input (input_type=3).
 
         Several buttons share ``adc_pin``, distinguished by voltage. ``thresholds``
         is N+1 strictly-descending ADC values: button i (reporting ``id_base + i``)
