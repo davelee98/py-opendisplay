@@ -134,6 +134,20 @@ def _rotate_source_image(image: Image.Image, rotate: Rotation) -> Image.Image:
     return image
 
 
+def _capabilities_from_config(config: GlobalConfig) -> DeviceCapabilities:
+    if not config.displays:
+        raise RuntimeError("Config has no display information")
+
+    display = config.displays[0]
+    rotation = display.rotation_enum
+    return DeviceCapabilities(
+        width=display.pixel_width,
+        height=display.pixel_height,
+        color_scheme=ColorScheme.from_value(display.color_scheme),
+        rotation=rotation.value if isinstance(rotation, Rotation) else 0,
+    )
+
+
 def prepare_image(
     image: Image.Image,
     config: GlobalConfig | None = None,
@@ -185,16 +199,9 @@ def prepare_image(
         RuntimeError: If config has no display information
     """
     if capabilities is None:
-        if config is None or not config.displays:
+        if config is None:
             raise RuntimeError("Config has no display information")
-        display = config.displays[0]
-        r = display.rotation_enum
-        capabilities = DeviceCapabilities(
-            width=display.pixel_width,
-            height=display.pixel_height,
-            color_scheme=ColorScheme.from_value(display.color_scheme),
-            rotation=r.value if isinstance(r, Rotation) else 0,
-        )
+        capabilities = _capabilities_from_config(config)
 
     if panel_ic_type is None and config is not None and config.displays:
         panel_ic_type = config.displays[0].panel_ic_type
@@ -1237,9 +1244,8 @@ class OpenDisplayDevice:
             if compressed_data is None or zlib_window_bits(compressed_data) != ZIPXL_ZLIB_WINDOW_BITS:
                 compressed_data = compress_image_data(image_data, level=6, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
 
-        within_compressed_limit = (
-            compressed_data is not None
-            and (uses_zipxl_window or len(compressed_data) < MAX_COMPRESSED_SIZE)
+        within_compressed_limit = compressed_data is not None and (
+            uses_zipxl_window or len(compressed_data) < MAX_COMPRESSED_SIZE
         )
         if compress and supports_compression and compressed_data and within_compressed_limit:
             _LOGGER.info(
@@ -1604,22 +1610,11 @@ class OpenDisplayDevice:
         if not self._config:
             raise RuntimeError("No config available")
 
-        if not self._config.displays:
-            raise RuntimeError("Config has no display information")
-
-        display = self._config.displays[0]  # Primary display
-
-        r = display.rotation_enum
         try:
-            color_scheme = ColorScheme.from_value(display.color_scheme)
+            return _capabilities_from_config(self._config)
         except ValueError as exc:
+            display = self._config.displays[0]
             raise ImageEncodingError(
                 f"Device uses unsupported color scheme value {display.color_scheme}. "
                 "Reconfigure the device to a supported color scheme (0–5)."
             ) from exc
-        return DeviceCapabilities(
-            width=display.pixel_width,
-            height=display.pixel_height,
-            color_scheme=color_scheme,
-            rotation=r.value if isinstance(r, Rotation) else 0,
-        )
