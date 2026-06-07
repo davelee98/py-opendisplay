@@ -1,5 +1,34 @@
 # Changelog
 
+## [7.8.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.7.0...v7.8.0) (2026-06-03)
+
+
+### Features
+
+* add landing_url() device deep-link encoder ([72a8637](https://github.com/OpenDisplay/py-opendisplay/commit/72a8637d3a028d8fd571336770e222881acb5b94))
+
+## [7.7.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.6.0...v7.7.0) (2026-06-03)
+
+
+### Features
+
+* parse nfc_config (0x2a) and flash_config (0x2b) packets ([4807bf0](https://github.com/OpenDisplay/py-opendisplay/commit/4807bf0eb0ce2bf88f2e112ac01b454ca8052154))
+
+## [7.6.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.5.0...v7.6.0) (2026-06-02)
+
+
+### Features
+
+* sync Solum/OpenDisplay board types with config tool ([7002029](https://github.com/OpenDisplay/py-opendisplay/commit/700202998dd44a7ff495c0f62b39f3d4918d6a5c))
+* sync Solum/OpenDisplay board types with config tool ([1872016](https://github.com/OpenDisplay/py-opendisplay/commit/18720167c1582c4ca292ac1f2caf1db6d3bea3ac))
+
+## [7.5.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.4.1...v7.5.0) (2026-06-02)
+
+
+### Features
+
+* BLE OTA firmware updates over Bluetooth proxies ([71c9062](https://github.com/OpenDisplay/py-opendisplay/commit/71c90627f7908a62e62184196c139f58b6eb8cb5))
+
 ## [7.4.1](https://github.com/OpenDisplay/py-opendisplay/compare/v7.4.0...v7.4.1) (2026-05-30)
 
 

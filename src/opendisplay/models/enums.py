@@ -67,14 +67,30 @@ class WaveshareBoardType(IntEnum):
 
 
 class SolumBoardType(IntEnum):
-    """Solum board types."""
+    """Solum board types.
 
+    Mirrors the ``board_type`` ``conditional_enum`` for ``manufacturer_id: 3``
+    in the Web config tool's ``config.yaml`` (source of truth).
+    """
+
+    M3_NRF_LITE = 0
+    M3_NRF = 1
+    M3_SILABS = 2
+    M3_SILABS_CORE = 3
+    M3_SILABS_PRO = 4
+    M3_SILABS_LITE = 5
+    M3_SILABS_PEGHOOK = 6
+
+    # Backwards-compat alias for the original single Solum entry (board_type 0).
     M3 = 0
 
 
 class OpenDisplayBoardType(IntEnum):
     """OpenDisplay board types."""
 
+    OD01 = 0
+
+    # Backwards-compat alias for the original name of board_type 0.
     DEFAULT = 0
 
 
@@ -83,6 +99,34 @@ class TouchIcType(IntEnum):
 
     NONE = 0
     GT911 = 1
+
+
+class NfcIcType(IntEnum):
+    """NFC controller IC types (config packet 0x2a)."""
+
+    AUTO = 0  # Currently resolves to the TNB132M flow in firmware
+    TNB132M = 1
+
+
+class FlashIcType(IntEnum):
+    """External flash IC types (config packet 0x2b)."""
+
+    AUTO = 0  # Generic SPI flash deep-sleep command flow
+
+
+class NfcFieldDetectMode(IntEnum):
+    """NFC field-detect sampling modes (config packet 0x2a)."""
+
+    DISABLED = 0
+    GPIO_LEVEL = 1
+    IRQ_LATCHED = 2
+
+
+class ActiveLevel(IntEnum):
+    """Active polarity for a GPIO line (shared by NFC/flash power and field-detect)."""
+
+    ACTIVE_LOW = 0
+    ACTIVE_HIGH = 1
 
 
 class CapacityEstimator(IntEnum):
@@ -151,11 +195,17 @@ _BOARD_TYPE_NAMES_WAVESHARE: Final[dict[WaveshareBoardType, str]] = {
 }
 
 _BOARD_TYPE_NAMES_SOLUM: Final[dict[SolumBoardType, str]] = {
-    SolumBoardType.M3: "M3",
+    SolumBoardType.M3_NRF_LITE: "M3 NRF Lite",
+    SolumBoardType.M3_NRF: "M3 NRF",
+    SolumBoardType.M3_SILABS: "M3 Silabs",
+    SolumBoardType.M3_SILABS_CORE: "M3 Silabs Core",
+    SolumBoardType.M3_SILABS_PRO: "M3 Silabs Pro",
+    SolumBoardType.M3_SILABS_LITE: "M3 Silabs Lite",
+    SolumBoardType.M3_SILABS_PEGHOOK: "M3 Silabs Peghook",
 }
 
 _BOARD_TYPE_NAMES_OPENDISPLAY: Final[dict[OpenDisplayBoardType, str]] = {
-    OpenDisplayBoardType.DEFAULT: "Default",
+    OpenDisplayBoardType.OD01: "OD01",
 }
 
 

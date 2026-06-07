@@ -84,43 +84,86 @@ class BLEConnection:
             return  # Already connected
 
         try:
-            _LOGGER.debug(
-                "Connecting to %s with bleak-retry-connector (max_attempts=%d)", self.mac_address, self.max_attempts
-            )
-
-            # Resolve MAC to BLEDevice if not provided
-            if self.ble_device:
-                device = self.ble_device
-            else:
-                # For MAC-only usage, scan for the device
-                found_device: BLEDevice | None = await BleakScanner.find_device_by_address(
-                    self.mac_address, timeout=self.timeout
-                )
-                if found_device is None:
-                    raise BLEConnectionError(f"Device {self.mac_address} not found during scan")
-                device = found_device
-
-            self.device_name = device.name
-
-            # Establish connection with retry logic
-            self._client = await establish_connection(
-                client_class=BleakClientWithServiceCache,
-                device=device,
-                name=device.name or self.mac_address,
-                max_attempts=self.max_attempts,
-                use_services_cache=self.use_services_cache,
-                timeout=self.timeout,
-            )
-
-            _LOGGER.debug("Connected to %s", self.mac_address)
-
-            # Start notifications
-            await self._setup_notifications()
-
+            await self._attempt_connect(use_services_cache=self.use_services_cache)
         except asyncio.TimeoutError as e:
             raise BLETimeoutError(f"Connection timeout after {self.timeout}s") from e
+        except BLEConnectionError as e:
+            # A stale Bluetooth-proxy GATT cache can make the expected service
+            # appear missing — e.g. after the device was last seen in the DFU/OTA
+            # bootloader, the proxy keeps serving the bootloader's GATT for this
+            # MAC. Clear the proxy cache and retry once with fresh discovery
+            # before giving up. (Only for the service-missing case; a plain
+            # "device not found during scan" is re-raised unchanged.)
+            if SERVICE_UUID.lower() not in str(e).lower():
+                raise
+            _LOGGER.debug(
+                "Connect to %s failed (%s); clearing GATT cache and retrying once",
+                self.mac_address,
+                e,
+            )
+            await self._clear_cache_and_drop()
+            try:
+                await self._attempt_connect(use_services_cache=False)
+            except asyncio.TimeoutError as e2:
+                raise BLETimeoutError(f"Connection timeout after {self.timeout}s") from e2
+            except Exception as e2:
+                raise BLEConnectionError(f"Failed to connect: {e2}") from e2
         except Exception as e:
             raise BLEConnectionError(f"Failed to connect: {e}") from e
+
+    async def _attempt_connect(self, *, use_services_cache: bool) -> None:
+        """Resolve the device, establish a connection, and set up notifications."""
+        _LOGGER.debug(
+            "Connecting to %s with bleak-retry-connector (max_attempts=%d, use_services_cache=%s)",
+            self.mac_address,
+            self.max_attempts,
+            use_services_cache,
+        )
+
+        # Resolve MAC to BLEDevice if not provided
+        if self.ble_device:
+            device = self.ble_device
+        else:
+            # For MAC-only usage, scan for the device
+            found_device: BLEDevice | None = await BleakScanner.find_device_by_address(
+                self.mac_address, timeout=self.timeout
+            )
+            if found_device is None:
+                raise BLEConnectionError(f"Device {self.mac_address} not found during scan")
+            device = found_device
+
+        self.device_name = device.name
+
+        # Establish connection with retry logic
+        self._client = await establish_connection(
+            client_class=BleakClientWithServiceCache,
+            device=device,
+            name=device.name or self.mac_address,
+            max_attempts=self.max_attempts,
+            use_services_cache=use_services_cache,
+            timeout=self.timeout,
+        )
+
+        _LOGGER.debug("Connected to %s", self.mac_address)
+
+        # Start notifications
+        await self._setup_notifications()
+
+    async def _clear_cache_and_drop(self) -> None:
+        """Clear the proxy GATT cache on the current client, then disconnect it."""
+        if self._client is None:
+            return
+        clear = getattr(self._client, "clear_cache", None)
+        if callable(clear):
+            try:
+                await clear()  # pylint: disable=not-callable
+            except Exception as err:  # noqa: BLE001 - best-effort
+                _LOGGER.debug("clear_cache during connect retry failed: %s", err)
+        try:
+            await self._client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        self._client = None
 
     async def disconnect(self) -> None:
         """Disconnect from device."""
@@ -132,6 +175,33 @@ class BLEConnection:
                 _LOGGER.warning("Error during disconnect: %s", e)
             finally:
                 self._client = None
+
+    async def clear_cache(self) -> bool:
+        """Clear the GATT services cache for this device.
+
+        On an ESPHome Bluetooth proxy this clears the proxy's cached per-MAC
+        GATT table so the next connection re-discovers services — needed when
+        the device's GATT changes without changing address (e.g. rebooting into
+        the Silabs AppLoader for OTA). Requires an active connection; the
+        on-device clear only works if the proxy firmware supports it (otherwise
+        only the in-memory cache is cleared).
+
+        Returns:
+            True if a cache was cleared, False if the backend has no cache
+            support (e.g. direct BlueZ on a bleak build without ``clear_cache``).
+
+        Raises:
+            BLEConnectionError: If not connected.
+        """
+        if not self._client or not self._client.is_connected:
+            raise BLEConnectionError("Not connected")
+        # The concrete client (BleakClientWithServiceCache) has clear_cache, but
+        # the declared BleakClient type does not — resolve it dynamically.
+        clear_cache_fn = getattr(self._client, "clear_cache", None)
+        if not callable(clear_cache_fn):
+            return False
+        # Guarded by callable() above; pylint can't infer through getattr.
+        return bool(await clear_cache_fn())  # pylint: disable=not-callable
 
     async def _setup_notifications(self) -> None:
         """Set up BLE notifications for responses.

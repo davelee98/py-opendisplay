@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-opendisplay"
-version = "7.4.1"
+version = "7.8.0"
 description = "Python library for OpenDisplay BLE e-paper displays"
 readme = "README.md"
 license = "MIT"
@@ -43,7 +43,10 @@ cli = [
     "rich>=13.0.0",
 ]
 nrf-ota = [
-    "nrf-ota>=0.3.0",
+    "nrf-ota>=0.4.0",
+]
+silabs-ota = [
+    "silabs-ble-ota>=0.1.0",
 ]
 test = [
     "pytest>=9.0.2",
@@ -78,7 +81,7 @@ warn_return_any = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["nrf_ota.*"]
+module = ["nrf_ota.*", "silabs_ble_ota.*"]
 ignore_missing_imports = true
 
 [tool.pylint.format]
@@ -97,7 +100,7 @@ max-positional-arguments = 16
 max-locals = 28              # _build_info_tree renders a complex tree with many conditional vars
 max-attributes = 22          # config dataclasses have many fields by nature
 max-branches = 25
-max-statements = 70
+max-statements = 80          # parse_tlv_config dispatches one branch per packet type
 max-returns = 9
 max-public-methods = 21      # OpenDisplayDevice API surface grows with device features
 
