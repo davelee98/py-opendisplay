@@ -16,6 +16,7 @@ import os
 import struct
 from dataclasses import dataclass
 
+import numpy as np
 from epaper_dithering import ColorScheme
 from PIL import Image
 
@@ -144,23 +145,12 @@ def compute_bounding_rect(
     height: int,
 ) -> tuple[int, int, int, int] | None:
     """Return (x0, y0, x1_excl, y1_excl) of changed pixels, or None if identical."""
-    if old == new:
+    diff = (np.frombuffer(old, np.uint8) != np.frombuffer(new, np.uint8)).reshape(height, width)
+    rows = np.flatnonzero(diff.any(axis=1))
+    if rows.size == 0:
         return None
-    min_x, max_x, min_y, max_y = width, -1, height, -1
-    for y in range(height):
-        row_off = y * width
-        row_changed = False
-        for x in range(width):
-            if old[row_off + x] != new[row_off + x]:
-                min_x = min(min_x, x)
-                max_x = max(max_x, x)
-                row_changed = True
-        if row_changed:
-            min_y = min(min_y, y)
-            max_y = max(max_y, y)
-    if max_x < 0:
-        return None
-    return (min_x, min_y, max_x + 1, max_y + 1)
+    cols = np.flatnonzero(diff.any(axis=0))
+    return (int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1)
 
 
 def align_rect(
@@ -200,32 +190,34 @@ def encode_segment_wire(
     cropped = palette_image.crop((x, y, x + w, y + h))
     pixels = cropped.tobytes()
 
+    # Unlike the full-frame encoders, the partial stream packs flat across row
+    # boundaries (no per-row byte padding), so the vectorized packing operates
+    # on the flat pixel buffer.
+    flat = np.frombuffer(pixels, dtype=np.uint8)
+
     if color_scheme == ColorScheme.MONO:
-        output = bytearray((len(pixels) + 7) // 8)
-        for i, palette_idx in enumerate(pixels):
-            if palette_idx > 0:
-                output[i // 8] |= 1 << (7 - (i % 8))
-        return bytes(output)
+        return np.packbits(flat > 0).tobytes()
 
     if color_scheme in (ColorScheme.BWRY, ColorScheme.GRAYSCALE_4):
-        output = bytearray((len(pixels) + 3) // 4)
-        for i, palette_idx in enumerate(pixels):
-            shift = (3 - (i % 4)) * 2
-            output[i // 4] |= (palette_idx & 0x03) << shift
-        return bytes(output)
+        p = flat & 0x03
+        pad = (-len(p)) % 4
+        if pad:
+            p = np.concatenate([p, np.zeros(pad, dtype=np.uint8)])
+        p = p.reshape(-1, 4)
+        packed = (p[:, 0] << 6) | (p[:, 1] << 4) | (p[:, 2] << 2) | p[:, 3]
+        return packed.astype(np.uint8).tobytes()
 
     if color_scheme in (ColorScheme.BWGBRY, ColorScheme.GRAYSCALE_16):
-        output = bytearray((len(pixels) + 1) // 2)
-        bwgbry_map = {0: 0, 1: 1, 2: 2, 3: 3, 4: 5, 5: 6}
-        for i, palette_idx in enumerate(pixels):
-            value = palette_idx & 0x0F
-            if color_scheme == ColorScheme.BWGBRY:
-                value = bwgbry_map.get(value, 0)
-            if i % 2 == 0:
-                output[i // 2] |= value << 4
-            else:
-                output[i // 2] |= value
-        return bytes(output)
+        idx = flat & 0x0F
+        if color_scheme == ColorScheme.BWGBRY:
+            lut = np.array([0, 1, 2, 3, 5, 6] + [0] * 10, dtype=np.uint8)
+            idx = lut[idx]
+        pad = len(idx) & 1
+        if pad:
+            idx = np.concatenate([idx, np.zeros(1, dtype=np.uint8)])
+        idx = idx.reshape(-1, 2)
+        packed = (idx[:, 0] << 4) | idx[:, 1]
+        return packed.astype(np.uint8).tobytes()
 
     return encode_image(cropped, color_scheme)
 
