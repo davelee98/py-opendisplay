@@ -243,6 +243,27 @@ class BLEConnection:
         # Put notification in queue for processing
         self._notification_queue.put_nowait(bytes(data))
 
+    def drain_notifications(self) -> int:
+        """Discard any queued notifications and return how many were dropped.
+
+        The queue has no request/response correlation, so a stale frame — e.g. a
+        response that arrived just after its read timed out, or an unsolicited
+        firmware frame — would otherwise be returned as the answer to the *next*
+        command and desync every subsequent read by one. Draining before writing
+        a command clears such leftovers; in healthy stop-and-wait operation the
+        queue is already empty here, so this is a no-op.
+        """
+        dropped = 0
+        while True:
+            try:
+                self._notification_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            dropped += 1
+        if dropped:
+            _LOGGER.warning("Discarded %d stale notification(s) before command", dropped)
+        return dropped
+
     async def write_command(self, data: bytes) -> None:
         """Write command to device.
 
@@ -257,6 +278,10 @@ class BLEConnection:
 
         if not self._notification_characteristic:
             raise BLEConnectionError("Notifications not set up")
+
+        # Clear any stale/unsolicited frames so this command's response is read
+        # from a clean queue (see drain_notifications).
+        self.drain_notifications()
 
         try:
             await self._client.write_gatt_char(
@@ -285,6 +310,13 @@ class BLEConnection:
                 timeout=timeout,
             )
         except asyncio.TimeoutError as e:
+            # asyncio.wait_for can cancel queue.get() *after* an item was handed
+            # to it, silently dropping that item. Re-check synchronously before
+            # giving up so a response delivered during cancellation is not lost.
+            try:
+                return self._notification_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
             raise BLETimeoutError(f"No response received within {timeout}s") from e
 
     @property
