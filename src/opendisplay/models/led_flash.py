@@ -47,8 +47,10 @@ class LedFlashConfig:
         _check_nibble("mode", self.mode)
         if not 1 <= self.brightness <= 16:
             raise ValueError(f"brightness out of range: {self.brightness} (must be 1-16)")
-        if self.group_repeats is not None and not 1 <= self.group_repeats <= 255:
-            raise ValueError(f"group_repeats out of range: {self.group_repeats} (must be 1-255 or None for infinite)")
+        # Encoded as group_repeats-1; raw 0xFE is the firmware's infinite
+        # sentinel, so 255 finite repeats would encode to 0xFE and loop forever.
+        if self.group_repeats is not None and not 1 <= self.group_repeats <= 254:
+            raise ValueError(f"group_repeats out of range: {self.group_repeats} (must be 1-254 or None for infinite)")
         _check_u8("reserved", self.reserved)
 
     @classmethod
@@ -125,7 +127,10 @@ class LedFlashConfig:
         mode = data[0] & 0x0F
         brightness = ((data[0] >> 4) & 0x0F) + 1
         group_raw = data[10]
-        group_repeats = None if group_raw == 0xFE else (group_raw + 1)
+        # 0xFE is the firmware's infinite sentinel; 0xFF (which our encoder never
+        # emits) is a firmware-valid unbounded value — treat both as infinite so
+        # parsing a device's payload never raises. Finite values decode as raw+1.
+        group_repeats = None if group_raw in (0xFE, 0xFF) else (group_raw + 1)
 
         return cls(
             mode=mode,

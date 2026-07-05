@@ -3,27 +3,32 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
+import hmac
 import logging
 import time
-from collections.abc import Callable
-from typing import TYPE_CHECKING
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, TypeVar
 
 from epaper_dithering import ColorScheme, DitherMode, dither_image
 from PIL import Image
 
 from .crypto import (
     compute_challenge_response,
+    compute_server_proof,
     decrypt_response,
     derive_session_id,
     derive_session_key,
     encrypt_command,
     generate_client_nonce,
 )
-from .display_palettes import PANELS_4GRAY, get_gray4_codes, get_palette_for_display
+from .display_palettes import PANELS_4GRAY, get_bwry_codes, get_gray4_codes, get_palette_for_display
 from .encoding import (
-    DEFAULT_ZLIB_WINDOW_BITS,
     ZIPXL_ZLIB_WINDOW_BITS,
     compress_image_data,
+    encode_2bpp,
     encode_bitplanes,
     encode_gray4_bitplanes,
     encode_image,
@@ -31,6 +36,7 @@ from .encoding import (
     zlib_window_bits,
 )
 from .exceptions import (
+    AuthenticationFailedError,
     AuthenticationRequiredError,
     AuthenticationSessionExistsError,
     BLETimeoutError,
@@ -46,7 +52,6 @@ from .models.enums import BoardManufacturer, FitMode, RefreshMode, Rotation
 from .models.firmware import FirmwareVersion
 from .models.led_flash import LedFlashConfig
 from .partial import (
-    ERR_ETAG_MISMATCH,
     PARTIAL_FLAG_COMPRESSED,
     PartialState,
     _generate_etag,
@@ -148,6 +153,47 @@ def _capabilities_from_config(config: GlobalConfig) -> DeviceCapabilities:
     )
 
 
+# pixels-per-byte for each direct-write color scheme. GRAYSCALE_4 is omitted:
+# firmware row-pads its upload, so a non-aligned width is safe there.
+_DIRECT_WRITE_PIXELS_PER_BYTE: dict[ColorScheme, int] = {
+    ColorScheme.MONO: 8,
+    ColorScheme.BWR: 8,
+    ColorScheme.BWY: 8,
+    ColorScheme.BWRY: 4,
+    ColorScheme.BWGBRY: 2,
+    ColorScheme.GRAYSCALE_16: 2,
+}
+
+
+def _warn_firmware_upload_limitations(color_scheme: ColorScheme, width: int) -> None:
+    """Warn about known device-firmware upload bugs the library can't fix on-device.
+
+    - BWR/BWY direct write drops the red/yellow plane on current firmware (C1).
+    - Widths not aligned to the scheme's byte boundary are truncated because the
+      firmware sizes the upload from the raw pixel count (C2). GRAYSCALE_4 is
+      exempt because firmware row-pads it.
+    """
+    if color_scheme in (ColorScheme.BWR, ColorScheme.BWY):
+        _LOGGER.warning(
+            "Color scheme %s (BWR/BWY direct write) is not reliably supported by current "
+            "firmware: it stores only one plane, so the red/yellow layer is discarded and "
+            "the black/white layer renders over stale color RAM. Output may be wrong until "
+            "device firmware gains BWR/BWY parity.",
+            color_scheme.name,
+        )
+
+    ppb = _DIRECT_WRITE_PIXELS_PER_BYTE.get(color_scheme)
+    if ppb is not None and width % ppb != 0:
+        _LOGGER.warning(
+            "Panel width %d is not a multiple of %d for color scheme %s; current firmware "
+            "sizes the upload from the raw pixel count and will truncate the last rows on "
+            "the device. A byte-aligned width avoids this.",
+            width,
+            ppb,
+            color_scheme.name,
+        )
+
+
 def prepare_image(
     image: Image.Image,
     config: GlobalConfig | None = None,
@@ -229,6 +275,8 @@ def prepare_image(
             panel_ic_type,
         )
 
+    _warn_firmware_upload_limitations(color_scheme, capabilities.width)
+
     palette = get_palette_for_display(panel_ic_type, color_scheme, use_measured_palettes)
     dithered = dither_image(
         image,
@@ -250,19 +298,50 @@ def prepare_image(
     elif color_scheme == ColorScheme.GRAYSCALE_4:
         # Two pre-split 1-bit planes concatenated; firmware streams the halves to PLANE_0/PLANE_1.
         image_data = b"".join(encode_gray4_bitplanes(dithered, get_gray4_codes(panel_ic_type)))
+    elif color_scheme == ColorScheme.BWRY:
+        # Some YR panels (0x001D/0x001E) use a native 4-color code order with
+        # yellow/red swapped relative to the dither palette; apply the per-panel
+        # code table so the firmware's raw-nibble direct write shows the right color.
+        image_data = encode_2bpp(dithered, codes=get_bwry_codes(panel_ic_type))
     else:
         image_data = encode_image(dithered, color_scheme)
 
     # Optionally compress
     compressed_data = None
     if compress:
-        display_cfg = config.displays[0] if (config and config.displays) else None
-        window_bits = (
-            ZIPXL_ZLIB_WINDOW_BITS if (display_cfg and display_cfg.supports_zipxl) else DEFAULT_ZLIB_WINDOW_BITS
-        )
-        compressed_data = compress_image_data(image_data, level=6, window_bits=window_bits)
+        # Current firmware compiles uzlib with a 9-bit window and hard-rejects any
+        # zlib header advertising more, so always compress with a 9-bit window
+        # regardless of ZIPXL: a 9-bit stream decodes fine on any firmware whose
+        # window is >= 9 (the firmware check is <=).
+        compressed_data = compress_image_data(image_data, level=6, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
 
     return image_data, compressed_data, dithered
+
+
+_T = TypeVar("_T")
+
+
+def _serialized(
+    func: Callable[..., Awaitable[_T]],
+) -> Callable[..., Awaitable[_T]]:
+    """Serialize a device command against all other commands on the same device.
+
+    Holds the per-device command lock across the whole call so that no two
+    command round-trips interleave — this prevents AES-CCM nonce reuse and
+    notification-queue response mixups under concurrency. The lock is reentrant
+    within a single task, so a command that internally triggers another
+    ``@_serialized`` call (e.g. an upload re-authenticating mid-stream) does not
+    deadlock.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(self: OpenDisplayDevice, *args: object, **kwargs: object) -> _T:
+        # This decorator is part of OpenDisplayDevice's own machinery; the
+        # "protected" transaction helper is intentionally used here.
+        async with self._transaction():  # pylint: disable=protected-access
+            return await func(self, *args, **kwargs)
+
+    return wrapper
 
 
 class OpenDisplayDevice:
@@ -363,6 +442,10 @@ class OpenDisplayDevice:
         self._nonce_counter: int = 0
         self._auth_time: float | None = None  # monotonic timestamp of last successful auth
 
+        # Serializes command round-trips (see _serialized / _transaction).
+        self._command_lock = asyncio.Lock()
+        self._lock_owner: asyncio.Task[object] | None = None
+
     async def __aenter__(self) -> OpenDisplayDevice:
         """Connect and optionally interrogate device."""
 
@@ -398,6 +481,7 @@ class OpenDisplayDevice:
             self._timeout,
             max_attempts=self._max_attempts,
             use_services_cache=self._use_services_cache,
+            disconnected_callback=self._on_ble_disconnect,
         )
 
         await self._conn.connect()
@@ -426,6 +510,8 @@ class OpenDisplayDevice:
         """Disconnect from device."""
         if self._connection is not None:
             await self._conn.disconnect()
+        # Forget the session so a reused device object re-authenticates cleanly.
+        self._clear_session()
 
     @property
     def _conn(self) -> BLEConnection:
@@ -433,6 +519,41 @@ class OpenDisplayDevice:
         if self._connection is None:
             raise RuntimeError("Device not connected")
         return self._connection
+
+    @asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[None]:
+        """Hold the command lock for the duration of a command round-trip.
+
+        Reentrant per task: if the current task already owns the lock (e.g. a
+        re-authentication triggered from within an upload), the nested call runs
+        without re-acquiring instead of deadlocking.
+        """
+        current = asyncio.current_task()
+        if self._lock_owner is current:
+            yield
+            return
+        async with self._command_lock:
+            self._lock_owner = current
+            try:
+                yield
+            finally:
+                self._lock_owner = None
+
+    def _clear_session(self) -> None:
+        """Drop any encryption session state.
+
+        Called on disconnect so a reused device object does not encrypt against
+        a session the firmware has already torn down.
+        """
+        self._session_key = None
+        self._session_id = None
+        self._nonce_counter = 0
+        self._auth_time = None
+
+    def _on_ble_disconnect(self) -> None:
+        """Handle an unexpected BLE drop: forget the (now-dead) session."""
+        _LOGGER.debug("Link to %s dropped; clearing session state", self.mac_address)
+        self._clear_session()
 
     async def _write(self, data: bytes) -> None:
         """Write a command, encrypting it if an active session exists."""
@@ -487,6 +608,7 @@ class OpenDisplayDevice:
             )
         return raw
 
+    @_serialized
     async def authenticate(self, key: bytes) -> None:
         """Perform two-step challenge-response authentication with the device.
 
@@ -519,10 +641,20 @@ class OpenDisplayDevice:
         challenge = compute_challenge_response(key, server_nonce, client_nonce, device_id)
         await self._conn.write_command(build_authenticate_step2(client_nonce, challenge))
         success_response = await self._conn.read_response(timeout=self.TIMEOUT_ACK)
-        parse_authenticate_success(success_response)  # raises on wrong key / error
+        server_proof = parse_authenticate_success(success_response)  # raises on wrong key / error
 
         # Derive session key and ID
-        self._session_key = derive_session_key(key, client_nonce, server_nonce, device_id)
+        session_key = derive_session_key(key, client_nonce, server_nonce, device_id)
+
+        # Verify the device's mutual-auth proof so we authenticate the device, not
+        # just the other way around. A device (or MITM) that returns status OK
+        # without knowing the master key cannot produce this CMAC. Constant-time
+        # compare to avoid leaking a timing side channel.
+        expected_proof = compute_server_proof(session_key, server_nonce, client_nonce, device_id)
+        if not hmac.compare_digest(server_proof, expected_proof):
+            raise AuthenticationFailedError("Device failed mutual authentication (server proof mismatch)")
+
+        self._session_key = session_key
         self._session_id = derive_session_id(self._session_key, client_nonce, server_nonce)
         self._nonce_counter = 0
         self._auth_time = time.monotonic()
@@ -672,6 +804,7 @@ class OpenDisplayDevice:
                 pass
         return bytes.fromhex(self.mac_address.replace(":", ""))[-3:]
 
+    @_serialized
     async def interrogate(self) -> GlobalConfig:
         """Read device configuration from device.
 
@@ -689,6 +822,13 @@ class OpenDisplayDevice:
 
         # Read first chunk
         response = await self._read(self.TIMEOUT_FIRST_CHUNK)
+
+        # Firmware answers a device-with-no-config with the 4-byte error frame
+        # {0xFF, 0x40, 0x00, 0x00}. Without this check the {0x00,0x00} length
+        # field is misread as a zero-length config instead of "no config".
+        if len(response) == 4 and response[0] == 0xFF and response[1] == CommandCode.READ_CONFIG:
+            raise ProtocolError("Device has no stored configuration (READ_CONFIG returned an error frame)")
+
         chunk_data = strip_command_echo(response, CommandCode.READ_CONFIG)
 
         # Parse first chunk header
@@ -727,6 +867,7 @@ class OpenDisplayDevice:
 
         return self._config
 
+    @_serialized
     async def read_firmware_version(self) -> FirmwareVersion:
         """Read firmware version from device.
 
@@ -754,6 +895,7 @@ class OpenDisplayDevice:
 
         return self._fw_version
 
+    @_serialized
     async def reboot(self) -> None:
         """Reboot the device.
 
@@ -779,6 +921,7 @@ class OpenDisplayDevice:
         # Device will reset immediately - no ACK expected
         _LOGGER.info("Reboot command sent to %s - device will reset (connection will drop)", self.mac_address)
 
+    @_serialized
     async def trigger_dfu_bootloader(self) -> None:
         """Trigger the DFU bootloader on nRF devices (command 0x0051).
 
@@ -841,6 +984,7 @@ class OpenDisplayDevice:
         """
         return await self._conn.clear_cache()
 
+    @_serialized
     async def activate_led(
         self,
         led_instance: int,
@@ -894,6 +1038,7 @@ class OpenDisplayDevice:
         validate_ack_response(response, CommandCode.LED_ACTIVATE)
         return response
 
+    @_serialized
     async def activate_buzzer(
         self,
         buzzer_instance: int,
@@ -926,6 +1071,7 @@ class OpenDisplayDevice:
         validate_ack_response(response, CommandCode.BUZZER_ACTIVATE)
         return response
 
+    @_serialized
     async def write_config(self, config: GlobalConfig) -> None:
         """Write configuration to device.
 
@@ -1068,6 +1214,7 @@ class OpenDisplayDevice:
             rotate=rotate,
         )
 
+    @_serialized
     async def upload_image(
         self,
         image: Image.Image,
@@ -1132,11 +1279,16 @@ class OpenDisplayDevice:
         display_cfg = self._config.displays[0] if (self._config and self._config.displays) else None
         supports_compression = display_cfg.supports_zip if display_cfg else True
 
+        # When a partial upload may succeed, defer full-frame compression: it is
+        # pure waste if the partial path handles the update. _dispatch_upload
+        # compresses lazily on the full-upload fallback.
+        prepare_compress = compress and supports_compression and state is None
+
         # Prepare image (fit, dither, encode, compress)
         image_data, compressed_data, processed_image = self._prepare_image(
             image,
             dither_mode,
-            compress and supports_compression,
+            prepare_compress,
             serpentine=serpentine,
             exposure=exposure,
             saturation=saturation,
@@ -1161,7 +1313,7 @@ class OpenDisplayDevice:
 
         upload_refresh_mode = RefreshMode.FULL if state is not None else refresh_mode
         full_upload_etag = _generate_etag() if state is not None else None
-        await self._dispatch_upload(
+        etag_committed = await self._dispatch_upload(
             image_data,
             upload_refresh_mode,
             compress,
@@ -1172,9 +1324,10 @@ class OpenDisplayDevice:
 
         _LOGGER.info("Image upload complete")
         if state is not None:
-            self._update_partial_state(state, processed_image, image_data, full_upload_etag)
+            self._update_partial_state(state, processed_image, image_data, full_upload_etag if etag_committed else None)
         return processed_image
 
+    @_serialized
     async def upload_prepared_image(
         self,
         prepared_data: tuple[bytes, bytes | None, Image.Image],
@@ -1215,7 +1368,7 @@ class OpenDisplayDevice:
 
         upload_refresh_mode = RefreshMode.FULL if state is not None else refresh_mode
         full_upload_etag = _generate_etag() if state is not None else None
-        await self._dispatch_upload(
+        etag_committed = await self._dispatch_upload(
             image_data,
             upload_refresh_mode,
             compress,
@@ -1225,7 +1378,7 @@ class OpenDisplayDevice:
         )
         _LOGGER.info("Prepared image upload complete")
         if state is not None:
-            self._update_partial_state(state, processed_image, image_data, full_upload_etag)
+            self._update_partial_state(state, processed_image, image_data, full_upload_etag if etag_committed else None)
 
     async def _dispatch_upload(
         self,
@@ -1235,14 +1388,23 @@ class OpenDisplayDevice:
         compressed_data: bytes | None,
         progress_callback: Callable[[int, int], None] | None,
         new_etag: int | None = None,
-    ) -> None:
-        """Choose compressed or uncompressed upload protocol and execute it."""
+    ) -> bool:
+        """Choose compressed or uncompressed upload protocol and execute it.
+
+        Returns True if the device committed ``new_etag`` (END-with-etag was
+        sent), False if the firmware auto-completed the upload.
+        """
         display_cfg = self._config.displays[0] if (self._config and self._config.displays) else None
         supports_compression = display_cfg.supports_zip if display_cfg else True
         uses_zipxl_window = bool(display_cfg and display_cfg.supports_zipxl)
-        if compress and supports_compression and uses_zipxl_window:
-            if compressed_data is None or zlib_window_bits(compressed_data) != ZIPXL_ZLIB_WINDOW_BITS:
-                compressed_data = compress_image_data(image_data, level=6, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
+        if compress and supports_compression:
+            if uses_zipxl_window:
+                if compressed_data is None or zlib_window_bits(compressed_data) != ZIPXL_ZLIB_WINDOW_BITS:
+                    compressed_data = compress_image_data(image_data, level=6, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
+            elif compressed_data is None:
+                # Lazy compression for the deferred/partial-fallback path: matches
+                # what prepare_image would have produced for a non-ZIPXL device.
+                compressed_data = compress_image_data(image_data, level=6, window_bits=DEFAULT_ZLIB_WINDOW_BITS)
 
         within_compressed_limit = compressed_data is not None and (
             uses_zipxl_window or len(compressed_data) < MAX_COMPRESSED_SIZE
@@ -1253,7 +1415,7 @@ class OpenDisplayDevice:
                 len(compressed_data),
                 zlib_window_bits(compressed_data) or 0,
             )
-            await self._execute_upload(
+            return await self._execute_upload(
                 image_data,
                 refresh_mode,
                 use_compression=True,
@@ -1262,23 +1424,23 @@ class OpenDisplayDevice:
                 progress_callback=progress_callback,
                 new_etag=new_etag,
             )
+
+        # 4-gray ships the same two split planes (plane0 ++ plane1) over either
+        # transport; the firmware streams them to PLANE_0/PLANE_1 whether they
+        # arrive compressed or as raw 0x71 chunks, so no special-casing here.
+        if compress and not supports_compression:
+            _LOGGER.info("Device does not support compressed uploads, using uncompressed protocol")
+        elif compress and compressed_data:
+            _LOGGER.info("Compressed size exceeds %d bytes, using uncompressed protocol", MAX_COMPRESSED_SIZE)
         else:
-            # 4-gray ships the same two split planes (plane0 ++ plane1) over either
-            # transport; the firmware streams them to PLANE_0/PLANE_1 whether they
-            # arrive compressed or as raw 0x71 chunks, so no special-casing here.
-            if compress and not supports_compression:
-                _LOGGER.info("Device does not support compressed uploads, using uncompressed protocol")
-            elif compress and compressed_data:
-                _LOGGER.info("Compressed size exceeds %d bytes, using uncompressed protocol", MAX_COMPRESSED_SIZE)
-            else:
-                _LOGGER.info("Compression disabled or no compressed data, using uncompressed protocol")
-            await self._execute_upload(
-                image_data,
-                refresh_mode,
-                use_compression=False,
-                progress_callback=progress_callback,
-                new_etag=new_etag,
-            )
+            _LOGGER.info("Compression disabled or no compressed data, using uncompressed protocol")
+        return await self._execute_upload(
+            image_data,
+            refresh_mode,
+            use_compression=False,
+            progress_callback=progress_callback,
+            new_etag=new_etag,
+        )
 
     def _update_partial_state(
         self,
@@ -1287,15 +1449,23 @@ class OpenDisplayDevice:
         image_data: bytes,
         etag: int | None = None,
     ) -> None:
-        """After a successful full upload, refresh state to reflect what's now on the panel.
+        """After a full upload, refresh state to reflect what's now on the panel.
 
-        Stores the etag committed to the device on 0x72 (or generates one if
-        absent), then stashes the palette pixels for diffing on the next call.
+        ``etag`` is the etag committed to the device via END-with-etag, or None
+        if the upload auto-completed (no etag was committed). When None, the
+        device's displayed_etag was never set, so populating state.etag would
+        make the next partial attempt fail ERR_ETAG_MISMATCH (or match a stale
+        device etag and render against the wrong old plane). In that case
+        invalidate the partial state so the next upload goes full.
         ``image_data`` is unused but kept for API symmetry.
         """
         del image_data
+        if etag is None:
+            state.etag = 0
+            state.last_image = None
+            return
         palette_image = processed_image.convert("P") if processed_image.mode != "P" else processed_image
-        state.etag = _generate_etag() if etag is None else etag
+        state.etag = etag
         state.last_image = palette_image.tobytes()
         state.width, state.height = processed_image.size
         state.bytes_per_pixel = 1
@@ -1306,8 +1476,13 @@ class OpenDisplayDevice:
         stream_bytes: bytes,
         state: PartialState,
         progress_callback: Callable[[int, int], None] | None = None,
-    ) -> None:
-        """Send remaining 0x71 chunks and update upload progress."""
+    ) -> str:
+        """Send remaining 0x71 chunks and update upload progress.
+
+        Returns "success", or "fallback_full" if the device NACKed a chunk
+        before the refresh started (firmware aborts the partial on such a NACK,
+        so a subsequent full upload is safe).
+        """
         chunk_size = ENCRYPTED_CHUNK_SIZE if self._session_key is not None else CHUNK_SIZE
         total_stream_bytes = len(stream_bytes)
         bytes_sent = total_stream_bytes - len(remaining)
@@ -1319,14 +1494,20 @@ class OpenDisplayDevice:
             nack = parse_nack(ack)
             if nack is not None:
                 opcode, err = nack
+                _LOGGER.info(
+                    "Partial upload rejected mid-stream (opcode=0x%02x err=0x%02x); falling back to full upload",
+                    opcode,
+                    err,
+                )
                 state.etag = 0
                 state.last_image = None
-                raise ProtocolError(f"Partial 0x71 NACK: opcode=0x{opcode:02x} err=0x{err:02x}")
+                return "fallback_full"
             validate_ack_response(ack, CommandCode.DIRECT_WRITE_DATA)
             offset += len(chunk)
             bytes_sent += len(chunk)
             if progress_callback is not None:
                 progress_callback(bytes_sent, total_stream_bytes)
+        return "success"
 
     async def _maybe_upload_partial(
         self,
@@ -1375,8 +1556,10 @@ class OpenDisplayDevice:
         )
 
         logical_stream = build_partial_logical_stream(old_rect_bytes, new_rect_bytes)
-        window_bits = ZIPXL_ZLIB_WINDOW_BITS if display.supports_zipxl else DEFAULT_ZLIB_WINDOW_BITS
-        compressed_stream = compress_image_data(logical_stream, level=6, window_bits=window_bits)
+        # A partial stream rides inside the 0x76 initial bytes; firmware only
+        # accepts a <= 9-bit zlib window, so always use a 9-bit window (a 15-bit
+        # window would be NACKed with ERR_PARTIAL_STREAM on non-ZIPXL devices).
+        compressed_stream = compress_image_data(logical_stream, level=6, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
         use_compression = display.supports_zip and len(compressed_stream) < len(logical_stream)
         stream_bytes = compressed_stream if use_compression else logical_stream
 
@@ -1400,6 +1583,7 @@ class OpenDisplayDevice:
 
         # Start partial upload (0x76), stream remaining 0x71 chunks, and finish
         # with partial refresh.
+        max_start = ENCRYPTED_CHUNK_SIZE if self._session_key is not None else MAX_START_PAYLOAD
         start_pkt, remaining = build_direct_write_partial_start(
             old_etag=state.etag,
             new_etag=new_etag,
@@ -1409,6 +1593,7 @@ class OpenDisplayDevice:
             width=region.rw,
             height=region.rh,
             stream_bytes=stream_bytes,
+            max_start_payload=max_start,
         )
         await self._write(start_pkt)
         try:
@@ -1416,18 +1601,25 @@ class OpenDisplayDevice:
             nack = parse_nack(response)
             if nack is not None:
                 opcode, err = nack
-                if opcode == 0x76 and err == ERR_ETAG_MISMATCH:
-                    _LOGGER.info("Partial upload: etag mismatch; falling back to full upload")
-                    state.etag = 0
-                    state.last_image = None
-                    return "fallback_full"
-                raise ProtocolError(f"Partial 0x76 NACK: opcode=0x{opcode:02x} err=0x{err:02x}")
+                # No partial data has been applied yet, so any pre-refresh 0x76
+                # NACK (etag mismatch, rect OOB/align, flags, unsupported, ...) is
+                # safe to recover from by falling back to a full upload rather than
+                # raising and losing the upload entirely.
+                _LOGGER.info(
+                    "Partial upload rejected at START (opcode=0x%02x err=0x%02x); falling back to full upload",
+                    opcode,
+                    err,
+                )
+                state.etag = 0
+                state.last_image = None
+                return "fallback_full"
             validate_ack_response(response, CommandCode.DIRECT_WRITE_PARTIAL_START)
         except (BLETimeoutError, InvalidResponseError):
             _LOGGER.info("Partial upload start was not acknowledged; falling back to full upload")
             return "fallback_full"
 
-        await self._send_partial_chunks(remaining, stream_bytes, state, progress_callback)
+        if await self._send_partial_chunks(remaining, stream_bytes, state, progress_callback) == "fallback_full":
+            return "fallback_full"
 
         await self._write(build_direct_write_end_command(RefreshMode.PARTIAL.value))
         response = await self._read(self.TIMEOUT_ACK)
@@ -1456,7 +1648,7 @@ class OpenDisplayDevice:
         uncompressed_size: int | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
         new_etag: int | None = None,
-    ) -> None:
+    ) -> bool:
         """Execute image upload using compressed or uncompressed protocol.
 
         Args:
@@ -1465,6 +1657,10 @@ class OpenDisplayDevice:
             use_compression: True to use compressed protocol
             compressed_data: Compressed data (required if use_compression=True)
             uncompressed_size: Original size (required if use_compression=True)
+
+        Returns:
+            True if ``new_etag`` was committed via END-with-etag, False if the
+            firmware auto-completed the upload (no etag committed).
 
         Raises:
             ProtocolError: If upload fails
@@ -1537,6 +1733,10 @@ class OpenDisplayDevice:
         if command != CommandCode.DIRECT_WRITE_REFRESH_COMPLETE:
             raise ProtocolError(f"Unexpected response waiting for refresh: {command.name} (0x{command:04x})")
         _LOGGER.info("Display refresh complete")
+
+        # The etag is only committed on the device when we send END-with-etag;
+        # a firmware auto-END (auto_completed) never sets displayed_etag.
+        return not auto_completed and new_etag is not None
 
     async def _send_data_chunks(
         self,

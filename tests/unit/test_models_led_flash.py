@@ -72,3 +72,20 @@ def test_led_flash_config_rejects_invalid_values() -> None:
 
     with pytest.raises(ValueError, match="color out of range"):
         LedFlashStep(color=256)
+
+
+def test_group_repeats_255_rejected_to_avoid_infinite_sentinel() -> None:
+    # 255 would encode to raw 0xFE (the infinite sentinel) and loop forever (M11).
+    with pytest.raises(ValueError, match="group_repeats out of range"):
+        LedFlashConfig(group_repeats=255)
+
+
+def test_group_repeats_254_is_max_finite() -> None:
+    cfg = LedFlashConfig(group_repeats=254)
+    assert cfg.to_bytes()[10] == 253  # raw = group_repeats - 1
+
+
+def test_from_bytes_accepts_raw_0xff_without_raising() -> None:
+    payload = bytes([0x70, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0])
+    cfg = LedFlashConfig.from_bytes(payload)  # must not raise
+    assert cfg.group_repeats is None

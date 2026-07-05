@@ -88,7 +88,12 @@ def encode_image(
         # Palette indices 0-5 map to firmware values 0,1,2,3,5,6 (4 is skipped!)
         return encode_4bpp(image, bwgbry_mapping=True)
     if color_scheme == ColorScheme.GRAYSCALE_4:
-        return encode_2bpp(image)
+        # 4-gray needs two 1-bit controller planes, not packed 2bpp; the packed
+        # form is not accepted by any firmware path. prepare_image routes 4-gray
+        # through encode_gray4_bitplanes() instead.
+        raise ValueError(
+            f"Color scheme {color_scheme.name} requires two 1-bit planes, use encode_gray4_bitplanes() instead"
+        )
     if color_scheme == ColorScheme.GRAYSCALE_16:
         # 16-level grayscale uses 4bpp; palette indices 0-15 map directly (0=black, 15=white)
         return encode_4bpp(image)
@@ -117,7 +122,7 @@ def encode_1bpp(image: Image.Image) -> bytes:
     return np.packbits(pixels > 0, axis=1).tobytes()
 
 
-def encode_2bpp(image: Image.Image) -> bytes:
+def encode_2bpp(image: Image.Image, codes: tuple[int, int, int, int] | None = None) -> bytes:
     """Encode image to 2-bits-per-pixel format (4 colors).
 
     Format: 4 pixels per byte, MSB first
@@ -125,6 +130,9 @@ def encode_2bpp(image: Image.Image) -> bytes:
 
     Args:
         image: Palette image (mode 'P')
+        codes: Optional palette-index -> stored-nibble table. Used by BWRY panels
+            whose native 4-color code order differs from the dither palette order
+            (e.g. yellow/red swapped). Defaults to identity.
 
     Returns:
         Encoded bytes
@@ -135,9 +143,12 @@ def encode_2bpp(image: Image.Image) -> bytes:
     pixels = np.asarray(image)
     height, width = pixels.shape
 
-    # Mask to 2 bits, zero-pad the width to a multiple of 4 (matches the per-row
-    # byte boundary), then pack 4 pixels per byte MSB-first.
+    # Mask to 2 bits, remap through the panel code table if given, zero-pad the
+    # width to a multiple of 4 (matches the per-row byte boundary), then pack
+    # 4 pixels per byte MSB-first.
     p = (pixels & 0x03).astype(np.uint8)
+    if codes is not None:
+        p = np.asarray(codes, dtype=np.uint8)[p]
     pad = (-width) % 4
     if pad:
         p = np.pad(p, ((0, 0), (0, pad)))
