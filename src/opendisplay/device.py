@@ -1279,11 +1279,16 @@ class OpenDisplayDevice:
         display_cfg = self._config.displays[0] if (self._config and self._config.displays) else None
         supports_compression = display_cfg.supports_zip if display_cfg else True
 
+        # When a partial upload may succeed, defer full-frame compression: it is
+        # pure waste if the partial path handles the update. _dispatch_upload
+        # compresses lazily on the full-upload fallback.
+        prepare_compress = compress and supports_compression and state is None
+
         # Prepare image (fit, dither, encode, compress)
         image_data, compressed_data, processed_image = self._prepare_image(
             image,
             dither_mode,
-            compress and supports_compression,
+            prepare_compress,
             serpentine=serpentine,
             exposure=exposure,
             saturation=saturation,
@@ -1392,9 +1397,14 @@ class OpenDisplayDevice:
         display_cfg = self._config.displays[0] if (self._config and self._config.displays) else None
         supports_compression = display_cfg.supports_zip if display_cfg else True
         uses_zipxl_window = bool(display_cfg and display_cfg.supports_zipxl)
-        if compress and supports_compression and uses_zipxl_window:
-            if compressed_data is None or zlib_window_bits(compressed_data) != ZIPXL_ZLIB_WINDOW_BITS:
-                compressed_data = compress_image_data(image_data, level=6, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
+        if compress and supports_compression:
+            if uses_zipxl_window:
+                if compressed_data is None or zlib_window_bits(compressed_data) != ZIPXL_ZLIB_WINDOW_BITS:
+                    compressed_data = compress_image_data(image_data, level=6, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
+            elif compressed_data is None:
+                # Lazy compression for the deferred/partial-fallback path: matches
+                # what prepare_image would have produced for a non-ZIPXL device.
+                compressed_data = compress_image_data(image_data, level=6, window_bits=DEFAULT_ZLIB_WINDOW_BITS)
 
         within_compressed_limit = compressed_data is not None and (
             uses_zipxl_window or len(compressed_data) < MAX_COMPRESSED_SIZE
