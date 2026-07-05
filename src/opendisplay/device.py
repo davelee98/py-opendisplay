@@ -26,7 +26,7 @@ from .crypto import (
 )
 from .display_palettes import PANELS_4GRAY, get_bwry_codes, get_gray4_codes, get_palette_for_display
 from .encoding import (
-    ZIPXL_ZLIB_WINDOW_BITS,
+    FIRMWARE_ZLIB_WINDOW_BITS,
     compress_image_data,
     encode_2bpp,
     encode_bitplanes,
@@ -311,9 +311,9 @@ def prepare_image(
     if compress:
         # Current firmware compiles uzlib with a 9-bit window and hard-rejects any
         # zlib header advertising more, so always compress with a 9-bit window
-        # regardless of ZIPXL: a 9-bit stream decodes fine on any firmware whose
+        # regardless of transmission_modes: a 9-bit stream decodes fine on any firmware whose
         # window is >= 9 (the firmware check is <=).
-        compressed_data = compress_image_data(image_data, level=6, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
+        compressed_data = compress_image_data(image_data, level=6, window_bits=FIRMWARE_ZLIB_WINDOW_BITS)
 
     return image_data, compressed_data, dithered
 
@@ -1275,9 +1275,15 @@ class OpenDisplayDevice:
             self.color_scheme.name,
         )
 
-        # Check compression support early to avoid wasted CPU in _prepare_image
+        # Check compression support early to avoid wasted CPU in _prepare_image.
+        # Post-2.0 configs may advertise only streaming decompression (bit 0x01,
+        # historically ZIPXL) without the plain ZIP bit; firmware 2.0 accepts
+        # compressed uploads either way (<=1.81 NACKs without the ZIP bit and
+        # the upload falls back to uncompressed).
         display_cfg = self._config.displays[0] if (self._config and self._config.displays) else None
-        supports_compression = display_cfg.supports_zip if display_cfg else True
+        supports_compression = (
+            (display_cfg.supports_zip or display_cfg.supports_streaming_decompression) if display_cfg else True
+        )
 
         # When a partial upload may succeed, defer full-frame compression: it is
         # pure waste if the partial path handles the update. _dispatch_upload
@@ -1395,23 +1401,27 @@ class OpenDisplayDevice:
         sent), False if the firmware auto-completed the upload.
         """
         display_cfg = self._config.displays[0] if (self._config and self._config.displays) else None
-        supports_compression = display_cfg.supports_zip if display_cfg else True
-        uses_zipxl_window = bool(display_cfg and display_cfg.supports_zipxl)
+        supports_compression = (
+            (display_cfg.supports_zip or display_cfg.supports_streaming_decompression) if display_cfg else True
+        )
+        streaming_decompression = bool(display_cfg and display_cfg.supports_streaming_decompression)
         if (
             compress
             and supports_compression
             and (
                 compressed_data is None
-                or (uses_zipxl_window and zlib_window_bits(compressed_data) != ZIPXL_ZLIB_WINDOW_BITS)
+                or (streaming_decompression and zlib_window_bits(compressed_data) != FIRMWARE_ZLIB_WINDOW_BITS)
             )
         ):
-            # Firmware only accepts zlib streams with a <=9-bit window regardless
-            # of ZIPXL (see prepare_image), so the lazy deferred/partial-fallback
-            # compression must use it too.
-            compressed_data = compress_image_data(image_data, level=6, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
+            # Firmware only accepts zlib streams with a <=9-bit window (see
+            # prepare_image), so the lazy deferred/partial-fallback compression
+            # must use it too.
+            compressed_data = compress_image_data(image_data, level=6, window_bits=FIRMWARE_ZLIB_WINDOW_BITS)
 
         within_compressed_limit = compressed_data is not None and (
-            uses_zipxl_window or len(compressed_data) < MAX_COMPRESSED_SIZE
+            # The 50 KB cap protects the old buffered decompressor; streaming
+            # decompression (bit 0x01) has no whole-blob buffer.
+            streaming_decompression or len(compressed_data) < MAX_COMPRESSED_SIZE
         )
         if compress and supports_compression and compressed_data and within_compressed_limit:
             _LOGGER.info(
@@ -1562,8 +1572,8 @@ class OpenDisplayDevice:
         logical_stream = build_partial_logical_stream(old_rect_bytes, new_rect_bytes)
         # A partial stream rides inside the 0x76 initial bytes; firmware only
         # accepts a <= 9-bit zlib window, so always use a 9-bit window (a 15-bit
-        # window would be NACKed with ERR_PARTIAL_STREAM on non-ZIPXL devices).
-        compressed_stream = compress_image_data(logical_stream, level=6, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
+        # window would be NACKed with ERR_PARTIAL_STREAM by 9-bit firmware).
+        compressed_stream = compress_image_data(logical_stream, level=6, window_bits=FIRMWARE_ZLIB_WINDOW_BITS)
         use_compression = display.supports_zip and len(compressed_stream) < len(logical_stream)
         stream_bytes = compressed_stream if use_compression else logical_stream
 

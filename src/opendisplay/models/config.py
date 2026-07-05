@@ -288,18 +288,36 @@ class DisplayConfig:
     reserved: bytes  # 13 bytes
 
     @property
-    def supports_zipxl(self) -> bool:
-        """Check if display supports ZIP-XL (compressed streams use a 512-byte zlib window)."""
+    def supports_streaming_decompression(self) -> bool:
+        """Check if display supports streaming decompression (bit 0x01).
+
+        Bit 0x01 has been repurposed over time: RAW → ZIPXL → streaming
+        decompression. On current devices it means the firmware inflates
+        compressed uploads through a streaming decompressor (no whole-blob
+        buffer, so no 50 KB size cap; zlib window <= 9 bits). Post-2.0
+        device configs may set only this bit, without TRANSMISSION_MODE_ZIP.
+        """
         return bool(self.transmission_modes & 0x01)
 
     @property
+    def supports_zipxl(self) -> bool:
+        """Deprecated alias for supports_streaming_decompression (bit 0x01 was previously named ZIPXL)."""
+        return self.supports_streaming_decompression
+
+    @property
     def supports_raw(self) -> bool:
-        """Legacy alias for supports_zipxl (bit 0x01 was previously named TRANSMISSION_MODE_RAW)."""
-        return self.supports_zipxl
+        """Deprecated alias for supports_streaming_decompression (bit 0x01 was originally named RAW)."""
+        return self.supports_streaming_decompression
 
     @property
     def supports_zip(self) -> bool:
-        """Check if display supports ZIP compressed transmission (TRANSMISSION_MODE_ZIP)."""
+        """Check if display supports ZIP compressed transmission (bit 0x02).
+
+        The pre-2.0 convention: firmware <= 1.81 only accepts a compressed
+        START when this bit is set (NACKs it otherwise), and its buffered
+        decompressor holds the whole compressed blob in RAM (hence the 50 KB
+        cap). Pre-2.0 device configs may set only this bit.
+        """
         return bool(self.transmission_modes & 0x02)
 
     @property

@@ -3,6 +3,7 @@
 from .bitplanes import encode_bitplanes, encode_gray4_bitplanes
 from .compression import (
     DEFAULT_ZLIB_WINDOW_BITS,
+    FIRMWARE_ZLIB_WINDOW_BITS,
     ZIPXL_ZLIB_WINDOW_BITS,
     compress_image_data,
     decompress_image_data,
@@ -19,6 +20,7 @@ __all__ = [
     "encode_bitplanes",
     "encode_gray4_bitplanes",
     "DEFAULT_ZLIB_WINDOW_BITS",
+    "FIRMWARE_ZLIB_WINDOW_BITS",
     "ZIPXL_ZLIB_WINDOW_BITS",
     "compress_image_data",
     "decompress_image_data",

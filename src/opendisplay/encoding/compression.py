@@ -8,7 +8,15 @@ import zlib
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_ZLIB_WINDOW_BITS = zlib.MAX_WBITS
-ZIPXL_ZLIB_WINDOW_BITS = 9
+
+# Largest DEFLATE window current firmware accepts: uzlib is compiled with
+# OPENDISPLAY_ZLIB_WINDOW_BITS=9 and rejects zlib headers advertising more.
+FIRMWARE_ZLIB_WINDOW_BITS = 9
+
+# Deprecated alias: bit 0x01 of transmission_modes was historically named
+# ZIPXL; it now means "streaming decompression" and the window limit applies
+# to all compressed uploads, not just those devices.
+ZIPXL_ZLIB_WINDOW_BITS = FIRMWARE_ZLIB_WINDOW_BITS
 
 
 def compress_image_data(data: bytes, level: int = 6, window_bits: int = DEFAULT_ZLIB_WINDOW_BITS) -> bytes:
