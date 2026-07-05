@@ -109,6 +109,24 @@ class TestUploadImageCompressionDecision:
         assert captured["use_compression"] is True
 
     @pytest.mark.asyncio
+    async def test_uses_compression_when_streaming_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Post-2.0 configs may set only bit 0x01 (streaming decompression), no ZIP bit.
+
+        Verified on hardware (EN05, transmission_modes=0x09): firmware 2.0 accepts
+        compressed uploads; firmware <= 1.81 NACKs the compressed START and the
+        library falls back to uncompressed.
+        """
+        device = _make_device(config=_config(transmission_modes=0x09))
+        raw, compressed = b"\x01" * 100, b"\x02" * 10
+        monkeypatch.setattr(device, "_prepare_image", self._fake_prepare(raw, compressed))
+        captured, fake_execute = self._capture_execute()
+        monkeypatch.setattr(device, "_execute_upload", fake_execute)
+
+        await device.upload_image(Image.new("RGB", (2, 2)))
+
+        assert captured["use_compression"] is True
+
+    @pytest.mark.asyncio
     async def test_skips_compression_when_device_does_not_support_zip(self, monkeypatch: pytest.MonkeyPatch) -> None:
         device = _make_device(config=_config(transmission_modes=0x00))
         raw, compressed = b"\x01" * 100, b"\x02" * 10
@@ -235,7 +253,7 @@ def test_prepare_image_always_uses_9bit_zlib_window(transmission_modes: int) -> 
     """Firmware only accepts a <=9-bit zlib window, so full-frame compression must
     use a 9-bit window for both ZIP (0x02) and ZIPXL (0x03) devices (C3)."""
     from opendisplay import prepare_image
-    from opendisplay.encoding import ZIPXL_ZLIB_WINDOW_BITS, zlib_window_bits
+    from opendisplay.encoding import FIRMWARE_ZLIB_WINDOW_BITS, zlib_window_bits
 
     image = Image.new("RGB", (64, 64), (0, 0, 0))
     _, compressed, _ = prepare_image(
@@ -244,4 +262,4 @@ def test_prepare_image_always_uses_9bit_zlib_window(transmission_modes: int) -> 
         compress=True,
     )
     assert compressed is not None
-    assert zlib_window_bits(compressed) == ZIPXL_ZLIB_WINDOW_BITS
+    assert zlib_window_bits(compressed) == FIRMWARE_ZLIB_WINDOW_BITS

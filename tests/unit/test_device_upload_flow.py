@@ -341,11 +341,11 @@ async def test_after_fallback_data_chunks_use_uncompressed_timeout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_zipxl_accepts_large_compressed_data(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ZIPXL devices (bit 0x01) do not apply the legacy 50KB compressed-size limit."""
+async def test_dispatch_streaming_accepts_large_compressed_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Streaming-decompression devices (bit 0x01) do not apply the legacy 50KB compressed-size limit."""
     import random
 
-    from opendisplay.encoding import ZIPXL_ZLIB_WINDOW_BITS, compress_image_data, zlib_window_bits
+    from opendisplay.encoding import FIRMWARE_ZLIB_WINDOW_BITS, compress_image_data, zlib_window_bits
     from opendisplay.protocol.commands import MAX_COMPRESSED_SIZE
 
     # transmission_modes=0x03 → ZIPXL (bit 0) + ZIP (bit 1)
@@ -358,21 +358,21 @@ async def test_dispatch_zipxl_accepts_large_compressed_data(monkeypatch: pytest.
 
     monkeypatch.setattr(device, "_execute_upload", fake_execute)
     image_data = random.Random(0).randbytes(MAX_COMPRESSED_SIZE + 10 * 1024)
-    compressed_data = compress_image_data(image_data, window_bits=ZIPXL_ZLIB_WINDOW_BITS)
+    compressed_data = compress_image_data(image_data, window_bits=FIRMWARE_ZLIB_WINDOW_BITS)
     assert len(compressed_data) > MAX_COMPRESSED_SIZE
     await device._dispatch_upload(image_data, RefreshMode.FULL, True, compressed_data, None)
     assert captured["use_compression"] is True
-    assert zlib_window_bits(captured["compressed_data"]) == ZIPXL_ZLIB_WINDOW_BITS
+    assert zlib_window_bits(captured["compressed_data"]) == FIRMWARE_ZLIB_WINDOW_BITS
 
 
 @pytest.mark.asyncio
-async def test_dispatch_zipxl_recompresses_prepared_data_with_512_byte_window(
+async def test_dispatch_streaming_recompresses_prepared_data_with_512_byte_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prepared data for ZIPXL is repaired to the firmware's 512-byte zlib window."""
+    """Prepared data for streaming devices is repaired to the firmware's 512-byte zlib window."""
     from opendisplay.encoding import (
         DEFAULT_ZLIB_WINDOW_BITS,
-        ZIPXL_ZLIB_WINDOW_BITS,
+        FIRMWARE_ZLIB_WINDOW_BITS,
         compress_image_data,
         zlib_window_bits,
     )
@@ -390,15 +390,15 @@ async def test_dispatch_zipxl_recompresses_prepared_data_with_512_byte_window(
 
     await device._dispatch_upload(image_data, RefreshMode.FULL, True, compressed_data, None)
 
-    assert zlib_window_bits(captured["compressed_data"]) == ZIPXL_ZLIB_WINDOW_BITS
+    assert zlib_window_bits(captured["compressed_data"]) == FIRMWARE_ZLIB_WINDOW_BITS
 
 
 @pytest.mark.asyncio
-async def test_dispatch_non_zipxl_lazy_compression_uses_9bit_window(
+async def test_dispatch_zip_only_lazy_compression_uses_9bit_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Deferred compression (compressed_data=None) on a plain-ZIP device uses the 9-bit window."""
-    from opendisplay.encoding import ZIPXL_ZLIB_WINDOW_BITS, zlib_window_bits
+    from opendisplay.encoding import FIRMWARE_ZLIB_WINDOW_BITS, zlib_window_bits
 
     # transmission_modes=0x02 → ZIP only, no ZIPXL
     device = _make_device(transmission_modes=0x02)
@@ -414,7 +414,7 @@ async def test_dispatch_non_zipxl_lazy_compression_uses_9bit_window(
     await device._dispatch_upload(image_data, RefreshMode.FULL, True, None, None)
 
     assert captured["use_compression"] is True
-    assert zlib_window_bits(captured["compressed_data"]) == ZIPXL_ZLIB_WINDOW_BITS
+    assert zlib_window_bits(captured["compressed_data"]) == FIRMWARE_ZLIB_WINDOW_BITS
 
 
 # ─── _execute_upload: error paths ────────────────────────────────────────────
@@ -470,15 +470,17 @@ async def test_execute_upload_raises_on_unexpected_refresh_response() -> None:
 # ─── DisplayConfig.supports_raw alias ────────────────────────────────────────
 
 
-def test_display_config_supports_raw_aliases_supports_zipxl() -> None:
-    """supports_raw is a legacy alias for supports_zipxl (bit 0x01)."""
+def test_display_config_bit0_alias_properties() -> None:
+    """supports_zipxl and supports_raw are deprecated aliases for supports_streaming_decompression."""
     config = _make_config(transmission_modes=0x01)
     display_cfg = config.displays[0]
+    assert display_cfg.supports_streaming_decompression is True
     assert display_cfg.supports_zipxl is True
     assert display_cfg.supports_raw is True
 
     config_no = _make_config(transmission_modes=0x02)
     display_cfg_no = config_no.displays[0]
+    assert display_cfg_no.supports_streaming_decompression is False
     assert display_cfg_no.supports_zipxl is False
     assert display_cfg_no.supports_raw is False
 
