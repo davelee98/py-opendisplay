@@ -77,7 +77,7 @@ async def perform_nrf_dfu(
     """
     try:
         from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
-        from nrf_ota._const import DEFAULT_PRN, LEGACY_DFU_SERVICE_UUID, TYPE_APPLICATION
+        from nrf_ota._const import DEFAULT_PRN, TYPE_APPLICATION
         from nrf_ota._zip import _parse_zip_bytes
         from nrf_ota.dfu import LegacyDFU
     except ImportError as exc:
