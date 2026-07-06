@@ -1,9 +1,10 @@
 """Tests for bitplane encoding (BWR and BWY displays)."""
+
 import numpy as np
 import pytest
+from epaper_dithering import ColorScheme
 from PIL import Image
 
-from epaper_dithering import ColorScheme
 from opendisplay.encoding.bitplanes import encode_bitplanes
 
 
@@ -14,7 +15,7 @@ class TestBitplaneEncoding:
         """Test BWR encoding: black pixel should be (0,0)."""
         # Create 8x1 image with all black pixels (palette index 0)
         img_array = np.zeros((1, 8), dtype=np.uint8)
-        img = Image.fromarray(img_array, mode='P')
+        img = Image.fromarray(img_array, mode="P")
 
         plane1, plane2 = encode_bitplanes(img, ColorScheme.BWR)
 
@@ -28,7 +29,7 @@ class TestBitplaneEncoding:
         """Test BWR encoding: white pixel should be (1,0)."""
         # Create 8x1 image with all white pixels (palette index 1)
         img_array = np.ones((1, 8), dtype=np.uint8)
-        img = Image.fromarray(img_array, mode='P')
+        img = Image.fromarray(img_array, mode="P")
 
         plane1, plane2 = encode_bitplanes(img, ColorScheme.BWR)
 
@@ -42,7 +43,7 @@ class TestBitplaneEncoding:
         """Test BWR encoding: red pixel should be (1,1) - CRITICAL BUG FIX."""
         # Create 8x1 image with all red pixels (palette index 2)
         img_array = np.full((1, 8), 2, dtype=np.uint8)
-        img = Image.fromarray(img_array, mode='P')
+        img = Image.fromarray(img_array, mode="P")
 
         plane1, plane2 = encode_bitplanes(img, ColorScheme.BWR)
 
@@ -56,7 +57,7 @@ class TestBitplaneEncoding:
         """Test BWY encoding: yellow pixel should be (0,1)."""
         # Create 8x1 image with all yellow pixels (palette index 2)
         img_array = np.full((1, 8), 2, dtype=np.uint8)
-        img = Image.fromarray(img_array, mode='P')
+        img = Image.fromarray(img_array, mode="P")
 
         plane1, plane2 = encode_bitplanes(img, ColorScheme.BWY)
 
@@ -71,7 +72,7 @@ class TestBitplaneEncoding:
         # Pattern: [black, white, red, black, white, red, black, white]
         # Indices:  [  0,     1,   2,     0,     1,   2,     0,     1]
         img_array = np.array([[0, 1, 2, 0, 1, 2, 0, 1]], dtype=np.uint8)
-        img = Image.fromarray(img_array, mode='P')
+        img = Image.fromarray(img_array, mode="P")
 
         plane1, plane2 = encode_bitplanes(img, ColorScheme.BWR)
 
@@ -91,7 +92,7 @@ class TestBitplaneEncoding:
         # Pattern: [black, white, yellow, black, white, yellow, black, white]
         # Indices:  [  0,     1,      2,     0,     1,      2,     0,     1]
         img_array = np.array([[0, 1, 2, 0, 1, 2, 0, 1]], dtype=np.uint8)
-        img = Image.fromarray(img_array, mode='P')
+        img = Image.fromarray(img_array, mode="P")
 
         plane1, plane2 = encode_bitplanes(img, ColorScheme.BWY)
 
@@ -109,11 +110,14 @@ class TestBitplaneEncoding:
     def test_multi_row_encoding(self):
         """Test bitplane encoding with multiple rows."""
         # 2x8 image: first row all white, second row all red
-        img_array = np.array([
-            [1, 1, 1, 1, 1, 1, 1, 1],  # Row 0: white
-            [2, 2, 2, 2, 2, 2, 2, 2],  # Row 1: red
-        ], dtype=np.uint8)
-        img = Image.fromarray(img_array, mode='P')
+        img_array = np.array(
+            [
+                [1, 1, 1, 1, 1, 1, 1, 1],  # Row 0: white
+                [2, 2, 2, 2, 2, 2, 2, 2],  # Row 1: red
+            ],
+            dtype=np.uint8,
+        )
+        img = Image.fromarray(img_array, mode="P")
 
         plane1, plane2 = encode_bitplanes(img, ColorScheme.BWR)
 
@@ -132,7 +136,7 @@ class TestBitplaneEncoding:
     def test_invalid_color_scheme_raises_error(self):
         """Test that non-bitplane color schemes raise ValueError."""
         img_array = np.zeros((1, 8), dtype=np.uint8)
-        img = Image.fromarray(img_array, mode='P')
+        img = Image.fromarray(img_array, mode="P")
 
         # MONO should raise ValueError
         with pytest.raises(ValueError, match="Bitplane encoding only supports BWR/BWY"):
@@ -145,7 +149,7 @@ class TestBitplaneEncoding:
     def test_non_palette_image_raises_error(self):
         """Test that non-palette images raise ValueError."""
         # Create RGB image instead of palette
-        rgb_img = Image.new('RGB', (8, 1), color='white')
+        rgb_img = Image.new("RGB", (8, 1), color="white")
 
         with pytest.raises(ValueError, match="Expected palette image"):
             encode_bitplanes(rgb_img, ColorScheme.BWR)
