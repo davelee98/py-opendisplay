@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.11.1](https://github.com/OpenDisplay/py-opendisplay/compare/v7.11.0...v7.11.1) (2026-07-06)
+
+
+### Bug Fixes
+
+* bump epaper-dithering to 5.0.8 (tone=auto NaN collapse) ([4981bb7](https://github.com/OpenDisplay/py-opendisplay/commit/4981bb78dc56ce46a570c8e921389562d8c69e4c))
+* bump epaper-dithering to 5.0.8 (tone=auto NaN collapse) ([b229c36](https://github.com/OpenDisplay/py-opendisplay/commit/b229c36a4e762b2f8e8ce2d43b7160f19547ba41))
+
 ## [7.11.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.10.0...v7.11.0) (2026-07-06)
 
 
