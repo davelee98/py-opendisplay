@@ -19,6 +19,11 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Bounded number of clear-cache-and-rediscover retries on a stale-GATT-cache
+# failure: 1 initial attempt + up to MAX_CACHE_RETRIES retries. Kept small so a
+# genuinely broken link drops instead of looping.
+MAX_CACHE_RETRIES = 2
+
 
 class BLEConnection:
     """Manages BLE connection to OpenDisplay device.
@@ -91,33 +96,66 @@ class BLEConnection:
         if self._client and self._client.is_connected:
             return  # Already connected
 
-        try:
-            await self._attempt_connect(use_services_cache=self.use_services_cache)
-        except asyncio.TimeoutError as e:
-            raise BLETimeoutError(f"Connection timeout after {self.timeout}s") from e
-        except BLEConnectionError as e:
-            # A stale Bluetooth-proxy GATT cache can make the expected service
-            # appear missing — e.g. after the device was last seen in the DFU/OTA
-            # bootloader, the proxy keeps serving the bootloader's GATT for this
-            # MAC. Clear the proxy cache and retry once with fresh discovery
-            # before giving up. (Only for the service-missing case; a plain
-            # "device not found during scan" is re-raised unchanged.)
-            if SERVICE_UUID.lower() not in str(e).lower():
-                raise
-            _LOGGER.debug(
-                "Connect to %s failed (%s); clearing GATT cache and retrying once",
-                self.mac_address,
-                e,
-            )
-            await self._clear_cache_and_drop()
+        # A stale Bluetooth-proxy GATT cache can make a connection fail even though
+        # the device is present: the proxy serves a cached GATT layout whose handles
+        # no longer match the device (e.g. the expected service appears missing, or a
+        # CCCD write during notify setup hits an ATT "Invalid handle"). Recover by
+        # clearing the proxy cache and rediscovering with use_services_cache=False.
+        # This is bounded (MAX_CACHE_RETRIES) so a genuinely broken link drops the
+        # connection and raises instead of looping forever.
+        last_error: Exception | None = None
+        for attempt in range(MAX_CACHE_RETRIES + 1):
+            use_cache = self.use_services_cache and attempt == 0
             try:
-                await self._attempt_connect(use_services_cache=False)
-            except asyncio.TimeoutError as e2:
-                raise BLETimeoutError(f"Connection timeout after {self.timeout}s") from e2
-            except Exception as e2:
-                raise BLEConnectionError(f"Failed to connect: {e2}") from e2
-        except Exception as e:
-            raise BLEConnectionError(f"Failed to connect: {e}") from e
+                await self._attempt_connect(use_services_cache=use_cache)
+                return
+            except asyncio.TimeoutError as e:
+                await self._clear_cache_and_drop()
+                raise BLETimeoutError(f"Connection timeout after {self.timeout}s") from e
+            except Exception as e:  # noqa: BLE001 - classified below
+                last_error = e
+                if not self._is_stale_cache_error(e):
+                    # Not a cache problem (e.g. device not found during scan) — drop
+                    # the half-open link and fail fast; retrying won't help.
+                    await self._clear_cache_and_drop()
+                    raise BLEConnectionError(f"Failed to connect: {e}") from e
+                _LOGGER.debug(
+                    "Connect to %s failed (%s); clearing GATT cache and retrying "
+                    "(attempt %d/%d)",
+                    self.mac_address,
+                    e,
+                    attempt + 1,
+                    MAX_CACHE_RETRIES + 1,
+                )
+                # Clears the proxy cache AND disconnects, so the next iteration
+                # rediscovers from scratch and we never keep a stale connection.
+                await self._clear_cache_and_drop()
+
+        # Bounded attempts exhausted: the connection was already dropped by
+        # _clear_cache_and_drop() above.
+        raise BLEConnectionError(
+            f"Failed to connect after {MAX_CACHE_RETRIES + 1} attempts "
+            f"(last error: {last_error})"
+        ) from last_error
+
+    def _is_stale_cache_error(self, err: Exception) -> bool:
+        """Return True for GATT failures a proxy cache-clear + rediscovery can fix.
+
+        Covers a missing expected service AND handle-level mismatches (e.g. an
+        ESPHome proxy serving a cached GATT layout whose CCCD handle no longer
+        exists on the device -> ATT "Invalid handle" during notify setup).
+        Deliberately EXCLUDES a plain "not found during scan", which is a device
+        presence problem, not a cache one, and must not trigger cache-clear retries.
+        """
+        msg = str(err).lower()
+        if "not found during scan" in msg:
+            return False
+        return (
+            SERVICE_UUID.lower() in msg
+            or "invalid handle" in msg
+            or "invalid attribute" in msg
+            or "attribute not found" in msg
+        )
 
     async def _attempt_connect(self, *, use_services_cache: bool) -> None:
         """Resolve the device, establish a connection, and set up notifications."""
