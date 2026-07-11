@@ -340,6 +340,18 @@ class DisplayConfig:
         return bool(self.transmission_modes & 0x08)
 
     @property
+    def supports_pipe_write(self) -> bool:
+        """Check if display advertises sliding-window PIPE_WRITE (bit 0x10).
+
+        Secondary / positive gate only: firmware echoes the STORED TLV, so a
+        device flashed with pipe-capable firmware but an older config will not
+        set this bit. The 0x0080 probe is therefore authoritative (see
+        ``OpenDisplayDevice._negotiate_pipe``); this bit is an optional
+        fast-confidence signal, never a disqualifier for old firmware.
+        """
+        return bool(self.transmission_modes & 0x10)
+
+    @property
     def no_boot_text(self) -> bool:
         """Check if display should suppress boot text (TRANSMISSION_MODE_NO_BOOT_TEXT)."""
         return bool(self.transmission_modes & 0x80)

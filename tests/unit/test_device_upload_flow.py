@@ -110,7 +110,11 @@ def _make_config(transmission_modes: int = 0x02, width: int = 4, height: int = 4
 def _make_device(transmission_modes: int = 0x02, width: int = 4, height: int = 4) -> OpenDisplayDevice:
     config = _make_config(transmission_modes=transmission_modes, width=width, height=height)
     caps = DeviceCapabilities(width=width, height=height, color_scheme=ColorScheme.MONO)
-    return OpenDisplayDevice(mac_address="AA:BB:CC:DD:EE:FF", config=config, capabilities=caps)
+    # These tests exercise the LEGACY 0x70/0x71/0x72 wire protocol; max_queue_size=1
+    # disables the PIPE_WRITE probe so the scripted legacy responses line up.
+    return OpenDisplayDevice(
+        mac_address="AA:BB:CC:DD:EE:FF", config=config, capabilities=caps, max_queue_size=1
+    )
 
 
 # ─── _read(): encrypted session behaviour ────────────────────────────────────
@@ -558,7 +562,10 @@ def _make_gray4_device(transmission_modes: int = 0x02) -> OpenDisplayDevice:
     """Device reporting a 4-gray panel (uploads ship two split planes, plane0 ++ plane1)."""
     config = _make_config(transmission_modes=transmission_modes, width=8, height=8)
     caps = DeviceCapabilities(width=8, height=8, color_scheme=ColorScheme.GRAYSCALE_4)
-    return OpenDisplayDevice(mac_address="AA:BB:CC:DD:EE:FF", config=config, capabilities=caps)
+    # Legacy-protocol tests: disable the PIPE_WRITE probe (see _make_device).
+    return OpenDisplayDevice(
+        mac_address="AA:BB:CC:DD:EE:FF", config=config, capabilities=caps, max_queue_size=1
+    )
 
 
 @pytest.mark.asyncio

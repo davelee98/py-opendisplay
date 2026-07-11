@@ -10,7 +10,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, TypeVar, cast
 
 from epaper_dithering import ColorScheme, DitherMode, dither_image
 from PIL import Image
@@ -64,10 +64,15 @@ from .partial import (
 )
 from .protocol import (
     CHUNK_SIZE,
+    DEFAULT_MAX_FRAME,
     ENCRYPTED_CHUNK_SIZE,
     MAX_COMPRESSED_SIZE,
+    MAX_PTO,
     MAX_START_PAYLOAD,
+    PIPE_FRAME_OVERHEAD,
+    TIMEOUT_PIPE_PROBE,
     CommandCode,
+    PipeParams,
     build_authenticate_step1,
     build_authenticate_step2,
     build_buzzer_activate_command,
@@ -80,16 +85,29 @@ from .protocol import (
     build_direct_write_start_uncompressed,
     build_enter_dfu_command,
     build_led_activate_command,
+    build_pipe_write_data_command,
+    build_pipe_write_end_command,
+    build_pipe_write_start_command,
     build_read_config_command,
     build_read_fw_version_command,
     build_reboot_command,
     build_write_config_command,
+    classify_pipe_frame,
     parse_config_response,
     parse_firmware_version,
+    parse_pipe_data_ack,
+    parse_pipe_data_nack,
+    parse_pipe_start_response,
     serialize_config,
+    unpack_ack_ranges,
     validate_ack_response,
 )
 from .protocol.responses import (
+    PIPE_FRAME_ACK,
+    PIPE_FRAME_END_ACK,
+    PIPE_FRAME_END_NACK,
+    PIPE_FRAME_NACK,
+    PIPE_START_NACK_COMPRESSION,
     check_response_type,
     is_compressed_failure_frame,
     parse_authenticate_challenge,
@@ -383,6 +401,23 @@ class OpenDisplayDevice:
     TIMEOUT_COMPRESSED_END_ACK = 90.0  # Compressed END: decompression + full SPI write to IC (~60s on Spectra/ACeP)
     TIMEOUT_REFRESH = 90.0  # Display refresh (firmware spec: up to 60s)
 
+    # PIPE_WRITE per-path progress timeouts (Part 1 §1.4): a compressed chunk lands
+    # fast; an uncompressed chunk can block bbepWriteData on SPI for the Spectra/ACeP
+    # ~60s SPI-block budget, so 90s preserves it.
+    TIMEOUT_PIPE_DATA_COMPRESSED = 5.0
+    TIMEOUT_PIPE_DATA_UNCOMPRESSED = 90.0
+    # Compressed tail-flush: firmware ACKs only every N_eff accepted frames, so a
+    # tail of < N_eff unacked frames never earns a cadence ACK on its own. Rather
+    # than stalling chunk_timeout (5 s) waiting for one, block briefly and then
+    # dup-probe (resend the oldest unacked chunk) — the duplicate elicits an
+    # immediate ACK from firmware. Never applied to the uncompressed path, whose
+    # 90 s budget covers legitimate SPI stalls.
+    TIMEOUT_PIPE_TAIL_FLUSH = 0.5
+
+    # Version gate sentinel: None ⇒ version gating disabled, the 0x0080 probe is
+    # authoritative. Pin a (major, minor) tuple once a firmware release ships PIPE_WRITE.
+    PIPE_MIN_FW: tuple[int, int] | None = None
+
     def __init__(
         self,
         mac_address: str | None = None,
@@ -396,6 +431,8 @@ class OpenDisplayDevice:
         use_services_cache: bool = True,
         use_measured_palettes: bool = True,
         encryption_key: bytes | None = None,
+        blocks_per_ack: int = 8,
+        max_queue_size: int = 16,
     ):
         """Initialize OpenDisplay device.
 
@@ -411,6 +448,11 @@ class OpenDisplayDevice:
             use_services_cache: Enable GATT service caching for faster reconnections (default: True)
             use_measured_palettes: Use measured color palettes when available (default: True)
             encryption_key: 16-byte AES-128 master key for encrypted devices (optional).
+            blocks_per_ack: Requested PIPE_WRITE ACK cadence N (blocks per ack), 1..32
+                (default: 8). Negotiated down to the device maximum.
+            max_queue_size: Requested PIPE_WRITE window W (tokens in flight), 1..32
+                (default: 16). ``max_queue_size <= 1`` disables sliding-window fast
+                transfer entirely — legacy stop-and-wait only, no 0x0080 probe.
 
         Raises:
             ValueError: If neither or both mac_address and device_name provided
@@ -449,6 +491,13 @@ class OpenDisplayDevice:
         # Serializes command round-trips (see _serialized / _transaction).
         self._command_lock = asyncio.Lock()
         self._lock_owner: asyncio.Task[object] | None = None
+
+        # Sliding-window (PIPE_WRITE) tuning + per-connection capability cache.
+        self._blocks_per_ack = blocks_per_ack
+        self._max_queue_size = max_queue_size
+        self._pipe_params: PipeParams | None = None  # active transfer only
+        self._pipe_probed: bool = False  # capability determined this connection
+        self._pipe_supported: bool = False  # probe result (valid iff _pipe_probed)
 
     async def __aenter__(self) -> OpenDisplayDevice:
         """Connect and optionally interrogate device."""
@@ -555,9 +604,29 @@ class OpenDisplayDevice:
         self._auth_time = None
 
     def _on_ble_disconnect(self) -> None:
-        """Handle an unexpected BLE drop: forget the (now-dead) session."""
+        """Handle an unexpected BLE drop: forget the (now-dead) session and pipe state."""
         _LOGGER.debug("Link to %s dropped; clearing session state", self.mac_address)
         self._clear_session()
+        # All pipe negotiation/capability state is per-connection (Part 1 §1.1).
+        self._pipe_probed = False
+        self._pipe_supported = False
+        self._pipe_params = None
+
+    def _encrypt_frame(self, data: bytes) -> bytes:
+        """Encrypt one plaintext command frame under the active session.
+
+        Advances the nonce counter by one so every transmission — including a
+        PIPE_WRITE retransmission — carries a fresh, higher nonce. Returns ``data``
+        unchanged when no session is active. Does NOT re-authenticate (callers
+        handle re-auth once before a stream, never mid-stream).
+        """
+        if self._session_key is not None and self._session_id is not None:
+            cmd = data[:2]
+            payload = data[2:]
+            frame = encrypt_command(self._session_key, self._session_id, self._nonce_counter, cmd, payload)
+            self._nonce_counter += 1
+            return frame
+        return data
 
     async def _write(self, data: bytes, response: bool = True) -> None:
         """Write a command, encrypting it if an active session exists.
@@ -570,13 +639,19 @@ class OpenDisplayDevice:
         """
         if self._session_key is not None and self._session_id is not None:
             await self._reauthenticate_if_needed()
-            cmd = data[:2]
-            payload = data[2:]
-            encrypted = encrypt_command(self._session_key, self._session_id, self._nonce_counter, cmd, payload)
-            self._nonce_counter += 1
-            await self._conn.write_command(encrypted, response=response)
+            await self._conn.write_command(self._encrypt_frame(data), response=response)
         else:
             await self._conn.write_command(data, response=response)
+
+    async def _write_pipe_frame(self, data: bytes, *, response: bool) -> None:
+        """Encrypt (no re-auth) and write a live PIPE_WRITE stream frame.
+
+        Passes ``drain_stale=False`` so queued sliding-window ACKs are preserved.
+        Used for every 0x0081 DATA frame (response=False) and the 0x0082 END
+        (response=True). Re-authentication is intentionally skipped: it runs once
+        before 0x0080 and never mid-stream (Part 1 §1.6).
+        """
+        await self._conn.write_command(self._encrypt_frame(data), response=response, drain_stale=False)
 
     async def _reauthenticate_if_needed(self) -> None:
         """Re-authenticate proactively at 90% of session_timeout_seconds."""
@@ -1780,6 +1855,32 @@ class OpenDisplayDevice:
         Raises:
             ProtocolError: If upload fails
         """
+        # 0. Sliding-window (PIPE_WRITE) attempt. Skipped when disabled
+        # (max_queue_size <= 1) or when this connection already probed negative.
+        pipe_eligible = self._max_queue_size > 1 and not (self._pipe_probed and not self._pipe_supported)
+        if pipe_eligible:
+            total_size = len(image_data)
+            params = await self._negotiate_pipe(use_compression, total_size)
+            self._pipe_probed = True
+            if params is not None:
+                self._pipe_supported = True
+                # Negotiation may have downgraded compressed→uncompressed (NACK 0x02).
+                if params.compressed and compressed_data is not None:
+                    payload = compressed_data
+                else:
+                    payload = image_data
+                    if params.compressed:
+                        # Contract: use_compression implies compressed_data; guard anyway.
+                        params = PipeParams(
+                            params.window, params.ack_every, params.max_frame, params.selective, False
+                        )
+                return await self._run_pipe_upload(
+                    payload, params, refresh_mode, total_size, progress_callback, new_etag
+                )
+            self._pipe_supported = False
+            _LOGGER.info("PIPE_WRITE unavailable on %s; using legacy direct-write flow", self.mac_address)
+            # Fall through to the untouched legacy flow below.
+
         # 1. Send START command (different for each protocol)
         if use_compression:
             if uncompressed_size is None or compressed_data is None:
@@ -1923,6 +2024,326 @@ class OpenDisplayDevice:
 
         _LOGGER.debug("All data chunks sent (%d chunks total)", chunks_sent)
         return False
+
+    # ─── PIPE_WRITE (sliding-window) upload ──────────────────────────────────
+
+    async def _negotiate_pipe(
+        self, compressed: bool, total_size: int, _retry_uncompressed: bool = True
+    ) -> PipeParams | None:
+        """Probe + negotiate a sliding-window transfer via 0x0080.
+
+        Sends PIPE_WRITE_START and waits ``TIMEOUT_PIPE_PROBE`` for the response.
+        Silence (old firmware ignoring the opcode) or an unrecoverable NACK returns
+        None → the caller falls back to the legacy 0x70 flow. A NACK err 0x02
+        (compression unsupported) on a compressed request retries 0x0080 once
+        uncompressed before giving up.
+
+        Returns:
+            PipeParams (effective, post-min-rule) on success, else None.
+        """
+        req_frame = DEFAULT_MAX_FRAME  # HA GATT ceiling; also our client_max_frame
+        # The 0x0080 is the single pre-stream write; _write re-authenticates here
+        # (once, never again mid-stream).
+        await self._write(
+            build_pipe_write_start_command(
+                compressed, self._max_queue_size, self._blocks_per_ack, req_frame, total_size
+            )
+        )
+        try:
+            resp = await self._read(TIMEOUT_PIPE_PROBE)
+        except BLETimeoutError:
+            _LOGGER.debug("No 0x0080 response within %.1fs; firmware lacks PIPE_WRITE", TIMEOUT_PIPE_PROBE)
+            return None
+
+        try:
+            ok, payload = parse_pipe_start_response(resp)
+        except InvalidResponseError as err:
+            _LOGGER.debug("Garbled 0x0080 response (%s); falling back to legacy", err)
+            return None
+
+        if not ok:
+            err_code = cast(int, payload)
+            if err_code == PIPE_START_NACK_COMPRESSION and compressed and _retry_uncompressed:
+                _LOGGER.info("Device rejected compressed PIPE_WRITE (err 0x02); retrying uncompressed")
+                return await self._negotiate_pipe(False, total_size, _retry_uncompressed=False)
+            _LOGGER.info("PIPE_WRITE START NACK (err 0x%02x); falling back to legacy", err_code)
+            return None
+
+        ver, dev_max_window, dev_max_ack_every, dev_max_frame, flags = cast(
+            "tuple[int, int, int, int, int]", payload
+        )
+        # Min-rule (Part 1 §1.1) — computed identically to firmware.
+        w_eff = max(1, min(self._max_queue_size, dev_max_window, 32))
+        n_eff = max(1, min(self._blocks_per_ack, dev_max_ack_every, w_eff))
+        frame_eff = min(req_frame, dev_max_frame)
+        selective = bool(flags & 0x01)
+        params = PipeParams(w_eff, n_eff, frame_eff, selective, compressed)
+        _LOGGER.info(
+            "PIPE_WRITE negotiated: W=%d N=%d frame=%d selective=%s compressed=%s (dev max %d/%d/%d, ver %d)",
+            w_eff,
+            n_eff,
+            frame_eff,
+            selective,
+            compressed,
+            dev_max_window,
+            dev_max_ack_every,
+            dev_max_frame,
+            ver,
+        )
+        return params
+
+    def _pipe_data_size(self, frame_eff: int) -> int:
+        """Chunk data capacity for a pipe frame at ``frame_eff`` bytes.
+
+        Encrypted: frame_eff - CCM envelope (31) - seq (1) = 212 @ 244.
+        Plaintext: frame_eff - PIPE_FRAME_OVERHEAD (cmd 2 + seq 1) = 241 @ 244.
+        """
+        if self._session_key is not None:
+            return frame_eff - 31 - 1
+        return frame_eff - PIPE_FRAME_OVERHEAD
+
+    async def _run_pipe_upload(
+        self,
+        payload: bytes,
+        params: PipeParams,
+        refresh_mode: RefreshMode,
+        total_size: int,
+        progress_callback: Callable[[int, int], None] | None,
+        new_etag: int | None,
+    ) -> bool:
+        """Split, stream, END, and await refresh for a sliding-window transfer.
+
+        Returns True if ``new_etag`` was committed via END-with-etag, False if the
+        firmware auto-completed the upload (no etag committed).
+        """
+        size = self._pipe_data_size(params.max_frame)
+        if size < 1:
+            raise ProtocolError(f"Negotiated pipe frame {params.max_frame} too small for a data byte")
+        # Always keep at least one frame so the receiver's total check + END
+        # handshake run even for an empty payload (mirrors legacy START/END).
+        chunks = [payload[i : i + size] for i in range(0, len(payload), size)] or [b""]
+        self._pipe_params = params
+        chunk_timeout = (
+            self.TIMEOUT_PIPE_DATA_COMPRESSED if params.compressed else self.TIMEOUT_PIPE_DATA_UNCOMPRESSED
+        )
+
+        try:
+            auto_completed = await self._send_pipe_chunks(chunks, params, chunk_timeout, progress_callback)
+            # Uncompressed transfers ALWAYS auto-complete (firmware resets pipe
+            # state and sends an unsolicited END_ACK once total_size is reached),
+            # so the explicit END path below is compressed-only. Sending an END
+            # after auto-complete would be NACKed and desync etag accounting.
+            if not auto_completed:
+                await self._await_pipe_end_ack(chunks, refresh_mode, new_etag, params)
+
+            # Shared refresh wait — identical to the legacy _execute_upload tail for
+            # both the auto-complete and explicit-END paths.
+            _LOGGER.debug("Display refresh started, waiting for completion...")
+            response = await self._read(self.TIMEOUT_REFRESH)
+            command, _ = check_response_type(response)
+            if command == CommandCode.DIRECT_WRITE_REFRESH_TIMEOUT:
+                raise ProtocolError("Display refresh timed out (device sent 0x74)")
+            if command != CommandCode.DIRECT_WRITE_REFRESH_COMPLETE:
+                raise ProtocolError(f"Unexpected response waiting for refresh: {command.name} (0x{command:04x})")
+            _LOGGER.info("Display refresh complete (pipe)")
+        finally:
+            self._pipe_params = None
+
+        return not auto_completed and new_etag is not None
+
+    async def _send_pipe_chunks(
+        self,
+        chunks: list[bytes],
+        params: PipeParams,
+        chunk_timeout: float,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        """QUIC-style selective-repeat sender for PIPE_WRITE data frames.
+
+        Keeps up to ``params.window`` frames in flight (span-based tokens), refunds
+        tokens on ACK, retransmits only missing chunks (selective repeat) — or
+        rewinds when the receiver does not buffer out-of-order (bit0 clear).
+
+        Completion contract differs by path:
+        - Compressed: returns once every chunk is acked; the caller sends the
+          explicit 0x0082 END (firmware can only verify totals at zlib flush).
+          A tail of < N_eff unacked frames never earns a cadence ACK, so the tail
+          wait uses TIMEOUT_PIPE_TAIL_FLUSH and a dup-probe instead of stalling
+          on chunk_timeout.
+        - Uncompressed: the client sends exactly total_size bytes, so firmware
+          ALWAYS auto-completes — flush-ACK, then an unsolicited {0x00,0x82},
+          resetting its pipe state before any explicit END could arrive. This
+          sender therefore keeps reading past the flush-ACK until that END_ACK
+          and returns True (mirroring legacy _send_data_chunks' 0x72-in-place-of-
+          0x71 handling); the caller must NOT send END.
+
+        Returns:
+            True if the device auto-completed (unsolicited END_ACK — always the
+            case for uncompressed), False on normal compressed completion
+            (caller sends END).
+
+        Raises:
+            ProtocolError: On a fatal NACK, MAX_RETX/MAX_PTO exhaustion, a missing
+                auto-complete END_ACK, or an unexpected frame.
+        """
+        n = len(chunks)
+        window = params.window
+        max_retx = 3 * window
+        acked: set[int] = set()
+        window_base = 0  # lowest unacked
+        next_to_send = 0
+        pending_retx: dict[int, int] = {}  # missing idx → ACKs seen since last (re)transmit
+        retx_count = 0
+        pto_count = 0
+        bytes_total = sum(len(c) for c in chunks)
+        bytes_sent_hw = 0
+
+        async def _send(idx: int) -> None:
+            nonlocal bytes_sent_hw
+            await self._write_pipe_frame(
+                build_pipe_write_data_command(idx % 256, chunks[idx]), response=False
+            )
+
+        while True:
+            # 1. Send new chunks while span-tokens are available.
+            while next_to_send < n and (next_to_send - window_base) < window:
+                await _send(next_to_send)
+                bytes_sent_hw += len(chunks[next_to_send])
+                if progress_callback is not None:
+                    progress_callback(min(bytes_sent_hw, bytes_total), bytes_total)
+                next_to_send += 1
+
+            # Compressed: all acked → done, caller sends the explicit END.
+            # Uncompressed: keep reading for the unsolicited auto-complete END_ACK.
+            if window_base >= n and params.compressed:
+                break
+
+            # 2. Block for an ACK (credit exhausted or tail pending). Compressed
+            # tail (< N_eff unacked frames, no holes) will never earn a cadence
+            # ACK, so wait only briefly before dup-probing — never send END with
+            # unacked chunks (a genuinely lost tail chunk must be repaired by
+            # retransmit, not surface as a fatal END NACK at zlib flush).
+            tail_flush = (
+                params.compressed
+                and next_to_send >= n
+                and 0 < n - window_base < params.ack_every
+                and not (acked and max(acked) >= window_base)  # no known holes
+            )
+            read_timeout = self.TIMEOUT_PIPE_TAIL_FLUSH if tail_flush else chunk_timeout
+            try:
+                resp = await self._read(read_timeout)
+            except BLETimeoutError:
+                if window_base >= n:
+                    # Uncompressed with everything acked: firmware owes the
+                    # unsolicited END_ACK; there is nothing left to probe.
+                    raise ProtocolError(
+                        "PIPE_WRITE aborted: auto-complete END_ACK never arrived"
+                    ) from None
+                pto_count += 1
+                if pto_count >= MAX_PTO:
+                    raise ProtocolError(
+                        f"PIPE_WRITE aborted: no ACK progress after {MAX_PTO} PTO probes"
+                    ) from None
+                # PTO / tail-flush dup-probe: resend the oldest unacked chunk
+                # (fresh nonce); a duplicate elicits an immediate ACK.
+                await _send(window_base)
+                retx_count += 1
+                if retx_count > max_retx:
+                    raise ProtocolError(f"PIPE_WRITE aborted: MAX_RETX ({max_retx}) exceeded (PTO)") from None
+                continue
+
+            kind = classify_pipe_frame(resp)
+            if kind == PIPE_FRAME_NACK:
+                err, _hs, _mask = parse_pipe_data_nack(resp)
+                raise ProtocolError(f"PIPE_WRITE data NACK err=0x{err:02x} (fatal)")
+            if kind == PIPE_FRAME_END_ACK:
+                # Unsolicited auto-complete: the receiver confirms it holds the full
+                # image (accepted total reached total_size), so it is authoritative
+                # and terminal — even if a final local ACK was lost. Mirrors legacy
+                # 0x72 auto-finish; the client sends no explicit END.
+                if window_base < n:
+                    _LOGGER.debug(
+                        "PIPE auto-complete END_ACK with %d/%d chunks locally acked", len(acked), n
+                    )
+                return True
+            if kind != PIPE_FRAME_ACK:
+                raise ProtocolError(f"Unexpected pipe frame during send: {resp[:8].hex()}")
+
+            # 3. Process the ACK — refund tokens over the contiguous acked prefix.
+            pto_count = 0
+            highest_seen, ack_mask = parse_pipe_data_ack(resp)
+            acked |= unpack_ack_ranges(highest_seen, ack_mask, window_base)
+            while window_base in acked:
+                pending_retx.pop(window_base, None)
+                window_base += 1
+            if window_base >= n:
+                # Loop top: compressed breaks (caller sends END); uncompressed
+                # keeps reading for the unsolicited auto-complete END_ACK.
+                continue
+
+            # 4. Loss handling — holes below the highest received are definite losses.
+            highest_recv = max(acked) if acked else window_base - 1
+            missing = [i for i in range(window_base, min(highest_recv, next_to_send)) if i not in acked]
+            if not missing:
+                continue
+
+            if params.selective:
+                for m in missing:  # oldest first
+                    if m not in pending_retx:
+                        do_retx = True  # newly detected
+                    else:
+                        pending_retx[m] += 1  # a new ACK still shows it missing
+                        do_retx = pending_retx[m] >= 1  # one implicit RTT of spacing
+                    if do_retx:
+                        await _send(m)
+                        pending_retx[m] = 0
+                        retx_count += 1
+                        if retx_count > max_retx:
+                            raise ProtocolError(f"PIPE_WRITE aborted: MAX_RETX ({max_retx}) exceeded")
+            else:
+                # bit0 clear: rewind-style recovery (resend from window_base).
+                next_to_send = window_base
+                pending_retx.clear()
+                retx_count += 1
+                if retx_count > max_retx:
+                    raise ProtocolError(f"PIPE_WRITE aborted: MAX_RETX ({max_retx}) exceeded (rewind)")
+
+        return False
+
+    async def _await_pipe_end_ack(
+        self,
+        chunks: list[bytes],
+        refresh_mode: RefreshMode,
+        new_etag: int | None,
+        params: PipeParams,
+    ) -> None:
+        """Send 0x0082 END and wait for the END_ACK (compressed transfers only).
+
+        Uncompressed transfers never reach here: firmware always auto-completes
+        them (see _send_pipe_chunks), and an END sent after that reset would be
+        NACKed. Called only after ``_send_pipe_chunks`` has seen every chunk
+        acked, so the transfer is complete; a trailing tail-flush PIPE_ACK may
+        precede the END_ACK in the queue and is skipped. An END_NACK or data
+        NACK aborts (the caller's existing retry-from-scratch recovers).
+        """
+        del chunks  # completeness already guaranteed by the sender loop
+        end_cmd = build_pipe_write_end_command(refresh_mode.value, new_etag)
+        await self._write_pipe_frame(end_cmd, response=True)
+
+        end_timeout = self.TIMEOUT_COMPRESSED_END_ACK if params.compressed else self.TIMEOUT_UNCOMPRESSED_END_ACK
+        while True:
+            resp = await self._read(end_timeout)
+            kind = classify_pipe_frame(resp)
+            if kind == PIPE_FRAME_END_ACK:
+                return
+            if kind == PIPE_FRAME_END_NACK:
+                raise ProtocolError("PIPE_WRITE END NACK (byte-total mismatch or incomplete transfer)")
+            if kind == PIPE_FRAME_NACK:
+                err, _hs, _mask = parse_pipe_data_nack(resp)
+                raise ProtocolError(f"PIPE_WRITE data NACK during END: err=0x{err:02x}")
+            if kind == PIPE_FRAME_ACK:
+                continue  # tail-flush ACK preceding END_ACK — ignore, keep reading
+            raise ProtocolError(f"Unexpected frame awaiting END_ACK: {resp[:8].hex()}")
 
     def _extract_capabilities_from_config(self) -> DeviceCapabilities:
         """Extract DeviceCapabilities from GlobalConfig.

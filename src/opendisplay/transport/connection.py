@@ -296,7 +296,7 @@ class BLEConnection:
             _LOGGER.warning("Discarded %d stale notification(s) before command", dropped)
         return dropped
 
-    async def write_command(self, data: bytes, response: bool = True) -> None:
+    async def write_command(self, data: bytes, response: bool = True, drain_stale: bool = True) -> None:
         """Write command to device.
 
         Args:
@@ -307,6 +307,11 @@ class BLEConnection:
                 which are still flow-controlled by the application-layer ACK. Falls
                 back to a Write Request if the characteristic does not advertise
                 write-without-response.
+            drain_stale: If True (default), discard any queued notifications before
+                writing so this command's response reads from a clean queue. MUST be
+                False for every write during a live PIPE_WRITE stream (0x81 data
+                frames AND the 0x82 END): the sliding window keeps ACKs queued ahead
+                of the sender, and draining would eat them.
 
         Raises:
             BLEConnectionError: If not connected or write fails
@@ -318,8 +323,10 @@ class BLEConnection:
             raise BLEConnectionError("Notifications not set up")
 
         # Clear any stale/unsolicited frames so this command's response is read
-        # from a clean queue (see drain_notifications).
-        self.drain_notifications()
+        # from a clean queue (see drain_notifications). Skipped mid-pipe-stream
+        # where queued ACKs are expected and must be preserved.
+        if drain_stale:
+            self.drain_notifications()
 
         # Only skip the write confirmation when the caller opts out AND the
         # characteristic actually supports it; otherwise keep write-with-response.

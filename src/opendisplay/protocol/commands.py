@@ -38,6 +38,11 @@ class CommandCode(IntEnum):
     ENTER_DFU = 0x0051  # Trigger DFU bootloader mode (nRF only)
     DEEP_SLEEP = 0x0052  # Enter deep sleep now (ESP32 timer-wake / Silabs EM4; nRF unsupported)
 
+    # Sliding-window image transfer (PIPE_WRITE, firmware 2.x+)
+    PIPE_WRITE_START = 0x0080  # Start + negotiate a sliding-window transfer
+    PIPE_WRITE_DATA = 0x0081  # Windowed data frame (seq + chunk); also device→host ACK/NACK opcode
+    PIPE_WRITE_END = 0x0082  # End sliding-window transfer and trigger display refresh
+
 
 # Protocol constants
 SERVICE_UUID = "00002446-0000-1000-8000-00805F9B34FB"
@@ -49,13 +54,18 @@ CHUNK_SIZE = 230  # Maximum data bytes per chunk (unencrypted)
 ENCRYPTED_CHUNK_SIZE = 154  # Maximum data bytes per chunk when session is active
 # Encrypted packet: cmd(2)+nonce(16)+len(1)+data(154)+tag(12) = 185 bytes
 CONFIG_CHUNK_SIZE = 200  # Maximum config chunk size (verified from firmware)
-PIPELINE_CHUNKS = 1  # One 0x71 write in flight at a time; ACK awaited after each chunk
-# NOTE: 0x71 data chunks use BLE Write Without Response (no ATT confirmation), but the
-# application-layer per-chunk ACK is still awaited, so only one write is ever outstanding.
 
 # Upload protocol constants
 MAX_COMPRESSED_SIZE = 50 * 1024  # Standard firmware buffer (nRF, ~50KB)
 MAX_START_PAYLOAD = 200  # Maximum bytes in START command (prevents MTU issues)
+
+# Sliding-window PIPE_WRITE (0x0080-0x0082) constants
+PIPE_VERSION = 1  # Protocol version carried in the 0x0080 request/response
+PIPE_FLAG_COMPRESSED = 0x01  # 0x0080 flags bit0: streamed bytes are zlib-compressed
+PIPE_FRAME_OVERHEAD = 3  # Plaintext 0x0081 header: cmd(2) + seq(1)
+DEFAULT_MAX_FRAME = 244  # HA native GATT write ceiling (client_max_frame request)
+TIMEOUT_PIPE_PROBE = 2.0  # Seconds to wait for a 0x0080 response before legacy fallback
+MAX_PTO = 3  # Consecutive silent probe timeouts before aborting a pipe transfer
 
 
 def build_read_config_command() -> bytes:
@@ -268,6 +278,109 @@ def build_direct_write_end_with_etag(refresh_mode: int, new_etag: int) -> bytes:
     if not 0 <= new_etag <= 0xFFFFFFFF:
         raise ValueError(f"new_etag out of uint32 range: {new_etag}")
     cmd = CommandCode.DIRECT_WRITE_END.to_bytes(2, byteorder="big")
+    return cmd + refresh_mode.to_bytes(1, byteorder="big") + new_etag.to_bytes(4, byteorder="big")
+
+
+def build_pipe_write_start_command(
+    compressed: bool,
+    window: int,
+    ack_every: int,
+    max_frame: int,
+    total_size: int,
+) -> bytes:
+    """Build a PIPE_WRITE_START (0x0080) start + negotiation command.
+
+    One round trip carries both the transfer parameters and the negotiation
+    request; the device replies with its own maxima (see parse_pipe_start_response).
+
+    Wire (12-byte payload):
+        [0x00][0x80][ver:1][flags:1][req_window:1][req_ack_every:1]
+                    [client_max_frame:2 LE][total_size:4 LE]
+        - ver         = PIPE_VERSION (1)
+        - flags bit0  = compressed (zlib, window_bits <= 9); other bits reserved 0
+        - req_window  = requested "max queue size" W (tokens in flight), 1..32
+        - req_ack_every = requested "blocks per ack" N, 1..32
+        - client_max_frame = client MTU-derived frame ceiling (<= 244)
+        - total_size  = decompressed panel byte total (both modes)
+
+    Unlike legacy compressed 0x70 START, this header is fixed-length and carries
+    NO inline data — all payload flows via 0x0081 DATA frames.
+
+    Args:
+        compressed: Whether the streamed bytes are zlib-compressed.
+        window: Requested window / max queue size (tokens in flight).
+        ack_every: Requested ACK cadence (blocks per ack).
+        max_frame: Client max frame size in bytes.
+        total_size: Decompressed panel byte total.
+
+    Returns:
+        Command bytes for 0x0080.
+
+    Raises:
+        ValueError: If any field is outside its wire range.
+    """
+    if not 0 <= window <= 0xFF:
+        raise ValueError(f"window out of uint8 range: {window}")
+    if not 0 <= ack_every <= 0xFF:
+        raise ValueError(f"ack_every out of uint8 range: {ack_every}")
+    if not 0 <= max_frame <= 0xFFFF:
+        raise ValueError(f"max_frame out of uint16 range: {max_frame}")
+    if not 0 <= total_size <= 0xFFFFFFFF:
+        raise ValueError(f"total_size out of uint32 range: {total_size}")
+
+    cmd = CommandCode.PIPE_WRITE_START.to_bytes(2, byteorder="big")
+    flags = PIPE_FLAG_COMPRESSED if compressed else 0
+    header = bytes([PIPE_VERSION, flags, window, ack_every])
+    return cmd + header + struct.pack("<H", max_frame) + struct.pack("<I", total_size)
+
+
+def build_pipe_write_data_command(seq: int, chunk: bytes) -> bytes:
+    """Build a PIPE_WRITE_DATA (0x0081) windowed data frame.
+
+    Wire (plaintext): [0x00][0x81][seq:1][data]
+        - seq  = chunk index mod 256, reset to 0 by each 0x0080
+        - data = chunk bytes (<= frame_eff - PIPE_FRAME_OVERHEAD)
+
+    When a session is active the frame is encrypted downstream (device._encrypt_frame):
+    the standard CCM envelope wraps ``[seq][data]`` as the plaintext payload, so seq
+    remains the first authenticated plaintext byte.
+
+    Args:
+        seq: Rolling sequence byte (0..255).
+        chunk: Chunk payload bytes.
+
+    Returns:
+        Command bytes for 0x0081.
+
+    Raises:
+        ValueError: If seq is outside 0..255.
+    """
+    if not 0 <= seq <= 0xFF:
+        raise ValueError(f"seq out of uint8 range: {seq}")
+    return CommandCode.PIPE_WRITE_DATA.to_bytes(2, byteorder="big") + bytes([seq]) + chunk
+
+
+def build_pipe_write_end_command(refresh_mode: int, new_etag: int | None = None) -> bytes:
+    """Build a PIPE_WRITE_END (0x0082) command.
+
+    Wire: [0x00][0x82][refresh:1] (+ [new_etag:4 BE] when provided).
+    The etag tail mirrors build_direct_write_end_with_etag; presence is by length.
+
+    Args:
+        refresh_mode: Display refresh mode (0=full, 1=fast/partial).
+        new_etag: Optional uint32 etag to commit on the device.
+
+    Returns:
+        Command bytes for 0x0082.
+
+    Raises:
+        ValueError: If new_etag is outside uint32 range.
+    """
+    cmd = CommandCode.PIPE_WRITE_END.to_bytes(2, byteorder="big")
+    if new_etag is None:
+        return cmd + refresh_mode.to_bytes(1, byteorder="big")
+    if not 0 <= new_etag <= 0xFFFFFFFF:
+        raise ValueError(f"new_etag out of uint32 range: {new_etag}")
     return cmd + refresh_mode.to_bytes(1, byteorder="big") + new_etag.to_bytes(4, byteorder="big")
 
 
