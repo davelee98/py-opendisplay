@@ -26,6 +26,24 @@
   ACK streams that never make progress (previously loops without a progress
   guarantee, reachable only with buggy/hostile firmware).
 
+## [7.12.0](https://github.com/OpenDisplay/py-opendisplay/compare/v7.11.2...v7.12.0) (2026-07-13)
+
+
+### Features
+
+* add deep sleep command (0x0052) ([4bec890](https://github.com/OpenDisplay/py-opendisplay/commit/4bec89098bb450fb1e0783de0cfd6aa58b3f066b))
+* add deep sleep command (0x0052) ([f78908c](https://github.com/OpenDisplay/py-opendisplay/commit/f78908ca0b5139eb8dfbd8964c35d6cd953e8491))
+* partial-region refresh over the PIPE_WRITE sliding window ([5d1374e](https://github.com/OpenDisplay/py-opendisplay/commit/5d1374e52355684546d612d3bae6a16222caf6db))
+* PIPE_WRITE sliding-window client (0x0080-0x0082) with QUIC selective repeat ([a19099f](https://github.com/OpenDisplay/py-opendisplay/commit/a19099fb70a0c27122ac55907abbb16509d5a9dc))
+* send 0x71 image-data chunks with BLE write-without-response ([3f1a0c1](https://github.com/OpenDisplay/py-opendisplay/commit/3f1a0c13fc13e2fa9890add406c39a83f3cc71f5))
+
+
+### Bug Fixes
+
+* bound and broaden BLE stale-GATT-cache connect recovery ([7940ac7](https://github.com/OpenDisplay/py-opendisplay/commit/7940ac7f134cac971c2b607df0d0705c42375d73))
+* don't mask auth/integrity errors in the pipe-partial fallback ([47b56ac](https://github.com/OpenDisplay/py-opendisplay/commit/47b56ac3af5e0cd3d5a26b0cb9e2ae20fdfcd870))
+* support grayscale images in fit_image padding ([7301958](https://github.com/OpenDisplay/py-opendisplay/commit/7301958b2c1f3e5babbf9d7e27d877e48db78d47))
+
 ## [7.11.2](https://github.com/OpenDisplay/py-opendisplay/compare/v7.11.1...v7.11.2) (2026-07-06)
 
 
