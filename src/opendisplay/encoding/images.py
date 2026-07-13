@@ -12,8 +12,11 @@ from ..models.enums import FitMode
 
 _LOGGER = logging.getLogger(__name__)
 
-# Fill color for CONTAIN and CROP padding (white, natural for e-paper)
-_PAD_COLOR = (255, 255, 255)
+
+def _pad_color_for_mode(mode: str) -> int | tuple[int, ...]:
+    """White fill color for CONTAIN/CROP padding, matching the image mode's band count."""
+    bands = Image.getmodebands(mode)
+    return 255 if bands == 1 else (255,) * bands
 
 
 def fit_image(
@@ -31,11 +34,17 @@ def fit_image(
     Returns:
         Image with exact target dimensions
     """
+    # Palette indices aren't colors: LANCZOS resampling would interpolate between
+    # unrelated index values, and a padded/pasted "P" canvas has no palette to
+    # decode them with. Decode to RGB first; dithering converts back later anyway.
+    if image.mode == "P":
+        image = image.convert("RGB")
+
     if fit == FitMode.STRETCH:
         return image.resize(target_size, Image.Resampling.LANCZOS)
 
     if fit == FitMode.CONTAIN:
-        return ImageOps.pad(image, target_size, Image.Resampling.LANCZOS, color=_PAD_COLOR)
+        return ImageOps.pad(image, target_size, Image.Resampling.LANCZOS, color=_pad_color_for_mode(image.mode))
 
     if fit == FitMode.COVER:
         return ImageOps.fit(image, target_size, Image.Resampling.LANCZOS)
@@ -53,7 +62,7 @@ def fit_image(
         # Paste centered onto white canvas if padding needed
         if crop_w == tw and crop_h == th:
             return cropped
-        canvas = Image.new("RGB", target_size, _PAD_COLOR)
+        canvas = Image.new(image.mode, target_size, _pad_color_for_mode(image.mode))
         paste_x = (tw - crop_w) // 2
         paste_y = (th - crop_h) // 2
         canvas.paste(cropped, (paste_x, paste_y))

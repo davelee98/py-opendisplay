@@ -1,16 +1,32 @@
 """Tests for image encoding functions."""
 
 import numpy as np
+import pytest
 from epaper_dithering import ColorScheme
 from PIL import Image
 
-from opendisplay.encoding.images import encode_image
+from opendisplay.encoding.images import encode_image, fit_image
+from opendisplay.models.enums import FitMode
 
 
 def _palette_image(pixels: list[list[int]]) -> Image.Image:
     """Create a palette-mode image from a 2D list of palette indices."""
     arr = np.array(pixels, dtype=np.uint8)
     return Image.fromarray(arr, mode="P")
+
+
+def _p_mode_image(width: int, height: int, index: int = 1) -> Image.Image:
+    """Create a P-mode image with a known palette.
+
+    Index 0 = red (255,0,0), index 1 = green (0,255,0).
+    All pixels are filled with ``index``.
+    """
+    img = Image.new("P", (width, height), index)
+    palette = [0] * 768
+    palette[0:3] = [255, 0, 0]
+    palette[3:6] = [0, 255, 0]
+    img.putpalette(palette)
+    return img
 
 
 class TestEncodeImageGrayscale16:
@@ -45,3 +61,118 @@ class TestEncodeImageGrayscale16:
         img = _palette_image([[0, 1, 2], [3, 4, 5]])
         result = encode_image(img, ColorScheme.GRAYSCALE_16)
         assert len(result) == 4  # ceil(3/2)=2 bytes/row × 2 rows
+
+
+class TestFitImage:
+    """Tests for fit_image covering mode preservation and P-mode conversion."""
+
+    def test_stretch_returns_exact_target_size(self) -> None:
+        img = Image.new("RGB", (20, 10), (128, 128, 128))
+        result = fit_image(img, (10, 10), FitMode.STRETCH)
+        assert result.size == (10, 10)
+
+    def test_contain_returns_exact_target_size(self) -> None:
+        img = Image.new("RGB", (20, 10), (128, 128, 128))
+        result = fit_image(img, (10, 10), FitMode.CONTAIN)
+        assert result.size == (10, 10)
+
+    def test_cover_returns_exact_target_size(self) -> None:
+        img = Image.new("RGB", (20, 10), (128, 128, 128))
+        result = fit_image(img, (10, 10), FitMode.COVER)
+        assert result.size == (10, 10)
+
+    def test_crop_returns_exact_target_size(self) -> None:
+        img = Image.new("RGB", (20, 10), (128, 128, 128))
+        result = fit_image(img, (10, 10), FitMode.CROP)
+        assert result.size == (10, 10)
+
+    def test_stretch_preserves_l_mode(self) -> None:
+        img = Image.new("L", (20, 10), 128)
+        result = fit_image(img, (10, 10), FitMode.STRETCH)
+        assert result.mode == "L"
+
+    def test_contain_preserves_l_mode(self) -> None:
+        img = Image.new("L", (20, 10), 128)
+        result = fit_image(img, (10, 10), FitMode.CONTAIN)
+        assert result.mode == "L"
+
+    def test_cover_preserves_l_mode(self) -> None:
+        img = Image.new("L", (20, 10), 128)
+        result = fit_image(img, (10, 10), FitMode.COVER)
+        assert result.mode == "L"
+
+    def test_crop_preserves_l_mode(self) -> None:
+        img = Image.new("L", (8, 8), 128)
+        result = fit_image(img, (10, 10), FitMode.CROP)
+        assert result.mode == "L"
+
+    def test_crop_l_mode_pads_white(self) -> None:
+        """Smaller-than-target L image gets white (255) padding."""
+        img = Image.new("L", (4, 4), 100)
+        result = fit_image(img, (10, 10), FitMode.CROP)
+        assert result.mode == "L"
+        assert result.size == (10, 10)
+        assert result.getpixel((0, 0)) == 255
+        assert result.getpixel((5, 5)) == 100
+
+    def test_contain_l_mode_pads_white(self) -> None:
+        """Aspect-ratio-preserving L-mode pad uses white fill."""
+        img = Image.new("L", (5, 10), 100)
+        result = fit_image(img, (10, 10), FitMode.CONTAIN)
+        assert result.mode == "L"
+        assert result.size == (10, 10)
+        assert result.getpixel((0, 5)) == 255
+
+    def test_stretch_converts_p_to_rgb(self) -> None:
+        img = _p_mode_image(20, 10, index=1)
+        result = fit_image(img, (10, 10), FitMode.STRETCH)
+        assert result.mode == "RGB"
+
+    def test_contain_converts_p_to_rgb(self) -> None:
+        img = _p_mode_image(20, 10, index=1)
+        result = fit_image(img, (10, 10), FitMode.CONTAIN)
+        assert result.mode == "RGB"
+
+    def test_cover_converts_p_to_rgb(self) -> None:
+        img = _p_mode_image(20, 10, index=1)
+        result = fit_image(img, (10, 10), FitMode.COVER)
+        assert result.mode == "RGB"
+
+    def test_crop_converts_p_to_rgb(self) -> None:
+        img = _p_mode_image(8, 8, index=1)
+        result = fit_image(img, (10, 10), FitMode.CROP)
+        assert result.mode == "RGB"
+
+    def test_crop_p_mode_preserves_colors(self) -> None:
+        """P-mode CROP: palette colors survive, padding is white."""
+        img = _p_mode_image(4, 4, index=1)  # green
+        result = fit_image(img, (10, 10), FitMode.CROP)
+        assert result.mode == "RGB"
+        assert result.getpixel((0, 0)) == (255, 255, 255)
+        assert result.getpixel((5, 5)) == (0, 255, 0)
+
+    def test_contain_p_mode_preserves_colors(self) -> None:
+        """P-mode CONTAIN: palette colors survive, padding is white."""
+        img = _p_mode_image(5, 10, index=1)  # green, tall
+        result = fit_image(img, (10, 10), FitMode.CONTAIN)
+        assert result.mode == "RGB"
+        assert result.getpixel((0, 5)) == (255, 255, 255)
+
+    def test_stretch_p_mode_preserves_colors(self) -> None:
+        """P-mode STRETCH: uniform green image stays green after resize."""
+        img = _p_mode_image(20, 10, index=1)
+        result = fit_image(img, (10, 10), FitMode.STRETCH)
+        assert result.mode == "RGB"
+        assert result.getpixel((5, 5)) == (0, 255, 0)
+
+    def test_crop_larger_image_no_padding(self) -> None:
+        """Image larger than target in both dimensions: pure center crop, no padding."""
+        img = Image.new("RGB", (20, 20), (0, 100, 200))
+        result = fit_image(img, (10, 10), FitMode.CROP)
+        assert result.size == (10, 10)
+        assert result.getpixel((5, 5)) == (0, 100, 200)
+
+    def test_unknown_fit_mode_raises(self) -> None:
+        img = Image.new("RGB", (10, 10))
+        with pytest.raises(ValueError, match="Unknown fit mode"):
+            fit_image(img, (10, 10), 99)  # type: ignore[arg-type]
