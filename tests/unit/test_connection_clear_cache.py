@@ -10,10 +10,15 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from bleak.exc import BleakError
 
 from opendisplay import OpenDisplayDevice
 from opendisplay.exceptions import BLEConnectionError
-from opendisplay.transport.connection import BLEConnection
+from opendisplay.transport.connection import MAX_CACHE_RETRIES, BLEConnection
+
+# A representative ESPHome-proxy stale-cache failure: the cached CCCD handle no
+# longer exists on the device, so the notify-enable descriptor write is rejected.
+_INVALID_HANDLE = "Bluetooth GATT Error address=CC:2D:73:41:2B:F1 handle=25 error=1 description=Invalid handle"
 
 
 def _connected(client: object) -> BLEConnection:
@@ -109,6 +114,72 @@ async def test_connect_does_not_retry_on_non_service_error() -> None:
     with patch.object(conn_mod, "establish_connection", fake_establish):
         with pytest.raises(BLEConnectionError, match="Failed to connect"):
             await conn.connect()
+
+
+@pytest.mark.asyncio
+async def test_connect_clears_cache_and_retries_on_invalid_handle() -> None:
+    """An ATT 'Invalid handle' during notify setup → clear cache + rediscover fresh.
+
+    This is the failure that previously bypassed recovery (a raw BleakError, not a
+    BLEConnectionError, and no SERVICE_UUID in the message) and looped forever.
+    """
+    conn = BLEConnection("AA:BB:CC:DD:EE:FF", ble_device=MagicMock())
+    conn._clear_cache_and_drop = AsyncMock()
+
+    used_cache: list[bool] = []
+
+    async def fake_attempt(*, use_services_cache: bool) -> None:
+        used_cache.append(use_services_cache)
+        if len(used_cache) == 1:
+            raise BleakError(_INVALID_HANDLE)
+        # second attempt succeeds
+
+    conn._attempt_connect = fake_attempt
+    await conn.connect()
+
+    assert used_cache == [True, False]  # first honors cache, retry rediscovers fresh
+    conn._clear_cache_and_drop.assert_awaited_once()  # poisoned cache cleared before retry
+
+
+@pytest.mark.asyncio
+async def test_connect_bounded_then_drops_on_persistent_stale_cache() -> None:
+    """A stale-cache error that never clears is bounded: fixed attempts, then dropped."""
+    conn = BLEConnection("AA:BB:CC:DD:EE:FF", ble_device=MagicMock())
+
+    attempts = 0
+
+    async def fake_attempt(*, use_services_cache: bool) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise BleakError(_INVALID_HANDLE)
+
+    conn._attempt_connect = fake_attempt
+    with pytest.raises(BLEConnectionError, match="Failed to connect after"):
+        await conn.connect()
+
+    assert attempts == MAX_CACHE_RETRIES + 1  # bounded, not infinite
+    assert conn._client is None  # connection dropped, not left half-open
+
+
+@pytest.mark.asyncio
+async def test_connect_not_found_during_scan_fails_fast() -> None:
+    """A device-absent error is re-raised immediately: no cache clear, no retries."""
+    conn = BLEConnection("AA:BB:CC:DD:EE:FF", ble_device=MagicMock())
+    conn._clear_cache_and_drop = AsyncMock()
+
+    attempts = 0
+
+    async def fake_attempt(*, use_services_cache: bool) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise BLEConnectionError("Device AA:BB:CC:DD:EE:FF not found during scan")
+
+    conn._attempt_connect = fake_attempt
+    with pytest.raises(BLEConnectionError, match="Failed to connect"):
+        await conn.connect()
+
+    assert attempts == 1  # fast-fail, no cache-clear retries
+    conn._clear_cache_and_drop.assert_awaited_once()  # half-open link still dropped
 
 
 @pytest.mark.asyncio

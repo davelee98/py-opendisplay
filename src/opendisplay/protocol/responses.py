@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+from dataclasses import dataclass
 
 from ..exceptions import (
     AuthenticationFailedError,
@@ -268,3 +269,190 @@ def parse_firmware_version(data: bytes) -> FirmwareVersion:
         "minor": minor,
         "sha": sha,
     }
+
+
+# ─── PIPE_WRITE (0x0080-0x0082) sliding-window responses ──────────────────────
+
+# 0x0080 START NACK error codes (Part 1 §1.1)
+PIPE_START_NACK_BAD_PARAMS = 0x01  # bad version / params
+PIPE_START_NACK_COMPRESSION = 0x02  # compression unsupported (retry uncompressed)
+PIPE_START_NACK_SIZE = 0x03  # total_size mismatch vs panel config
+PIPE_START_NACK_BUSY = 0x04  # busy / bad state
+PIPE_START_NACK_ETAG_MISMATCH = 0x05  # partial: old_etag == 0 or != device displayed_etag
+PIPE_START_NACK_PARTIAL_UNSUPPORTED = 0x06  # partial: bpp != 1 or unsupported driver
+PIPE_START_NACK_RECT_INVALID = 0x07  # partial: rect zero-size / OOB / misaligned
+
+# 0x0081 DATA NACK error codes (all fatal, Part 1 §1.3)
+PIPE_DATA_NACK_DECOMPRESS = 0x02
+PIPE_DATA_NACK_WRITE = 0x03
+PIPE_DATA_NACK_STATE = 0x04
+
+# Frame classifications returned by classify_pipe_frame().
+PIPE_FRAME_ACK = "PIPE_ACK"
+PIPE_FRAME_NACK = "PIPE_NACK"
+PIPE_FRAME_END_ACK = "END_ACK"
+PIPE_FRAME_END_NACK = "END_NACK"
+PIPE_FRAME_OTHER = "OTHER"
+
+
+@dataclass(frozen=True)
+class PipeParams:
+    """Effective sliding-window parameters after the min-rule negotiation.
+
+    All values are the negotiated effective ones (min of client request and
+    device maximum), computed identically on both sides.
+
+    Attributes:
+        window: W_eff — tokens in flight (1..32).
+        ack_every: N_eff — ACK cadence, clamped to <= window.
+        max_frame: frame_eff — effective frame size in bytes (<= 244).
+        selective: Response flags bit0 — receiver buffers out-of-order chunks
+            (selective repeat). When False the sender uses rewind-style recovery.
+        compressed: Whether this transfer streams zlib-compressed bytes.
+        partial: Whether this is a partial-region refresh (0x0080 flags bit1
+            requested and confirmed by the device's ACK flags bit1). Partial
+            transfers never auto-complete, so the sender always uses the explicit
+            0x0082 END completion contract.
+    """
+
+    window: int
+    ack_every: int
+    max_frame: int
+    selective: bool
+    compressed: bool
+    partial: bool = False
+
+
+def parse_pipe_start_response(data: bytes) -> tuple[bool, object]:
+    """Parse a PIPE_WRITE_START (0x0080) response.
+
+    Both forms tolerate trailing bytes (future fields).
+
+    ACK  (>= 8 B): [0x00][0x80][ver:1][dev_max_window:1][dev_max_ack_every:1]
+                   [dev_max_frame:2 LE][flags:1]
+    NACK (4 B):    [0xFF][0x80][err:1][0x00]
+
+    Args:
+        data: Decrypted response bytes (``_read`` yields the ``00 80`` / ``FF 80``
+            prefix on both plaintext and encrypted links).
+
+    Returns:
+        (True, (ver, dev_max_window, dev_max_ack_every, dev_max_frame, flags)) on ACK,
+        or (False, err_code) on NACK.
+
+    Raises:
+        InvalidResponseError: On a too-short/garbled ACK or an unexpected echo.
+    """
+    if len(data) < 2:
+        raise InvalidResponseError(f"PIPE START response too short: {len(data)} bytes")
+
+    if data[0] == 0xFF and data[1] == 0x80:
+        err = data[2] if len(data) >= 3 else 0
+        return False, err
+
+    if data[0] == 0x00 and data[1] == 0x80:
+        if len(data) < 8:
+            raise InvalidResponseError(f"PIPE START ACK too short: {len(data)} bytes (need >= 8)")
+        ver = data[2]
+        dev_max_window = data[3]
+        dev_max_ack_every = data[4]
+        dev_max_frame = int(struct.unpack("<H", data[5:7])[0])
+        flags = data[7]
+        return True, (ver, dev_max_window, dev_max_ack_every, dev_max_frame, flags)
+
+    raise InvalidResponseError(f"Unexpected PIPE START echo: 0x{data[0]:02x}{data[1]:02x}")
+
+
+def parse_pipe_data_ack(data: bytes) -> tuple[int, int]:
+    """Parse a PIPE_WRITE_DATA ACK: [0x00][0x81][highest_seen:1][ack_mask:4 LE].
+
+    Trailing bytes tolerated.
+
+    Returns:
+        (highest_seen, ack_mask)
+
+    Raises:
+        InvalidResponseError: If the frame is not a >= 7-byte 0x0081 ACK.
+    """
+    if len(data) < 7 or data[0] != 0x00 or data[1] != 0x81:
+        raise InvalidResponseError(f"Not a PIPE DATA ACK: {data[:8].hex()}")
+    highest_seen = data[2]
+    ack_mask = int(struct.unpack("<I", data[3:7])[0])
+    return highest_seen, ack_mask
+
+
+def parse_pipe_data_nack(data: bytes) -> tuple[int, int, int]:
+    """Parse a PIPE_WRITE_DATA NACK: [0xFF][0x81][err:1][highest_seen:1][ack_mask:4 LE].
+
+    Trailing bytes tolerated.
+
+    Returns:
+        (err, highest_seen, ack_mask)
+
+    Raises:
+        InvalidResponseError: If the frame is not a >= 8-byte 0xFF81 NACK.
+    """
+    if len(data) < 8 or data[0] != 0xFF or data[1] != 0x81:
+        raise InvalidResponseError(f"Not a PIPE DATA NACK: {data[:8].hex()}")
+    err = data[2]
+    highest_seen = data[3]
+    ack_mask = int(struct.unpack("<I", data[4:8])[0])
+    return err, highest_seen, ack_mask
+
+
+def unpack_ack_ranges(highest_seen: int, ack_mask: int, window_base: int) -> set[int]:
+    """Expand a QUIC-style ACK into absolute acked chunk indexes.
+
+    ``highest_seen`` is a rolling mod-256 seq; it is resolved against the sender's
+    ``window_base`` (lowest unacked absolute index). Because the in-flight range is
+    <= 32 « 256, the resolution is unambiguous — including when the ACK is stale
+    (its highest_seen sits just below window_base after a superseding ACK already
+    advanced the window).
+
+    ``ack_mask`` bit i (LSB first) marks chunk ``highest_seen - 1 - i`` as received.
+
+    Args:
+        highest_seen: Highest received seq (mod 256), implicitly acked.
+        ack_mask: 32-bit selective-ack bitmask.
+        window_base: Sender's lowest unacked absolute chunk index.
+
+    Returns:
+        Set of absolute chunk indexes the ACK reports as received.
+    """
+    base_mod = window_base % 256
+    delta = (highest_seen - base_mod) % 256
+    if delta > 128:  # highest_seen is behind window_base (stale / fully contiguous)
+        delta -= 256
+    h_abs = window_base + delta
+
+    acked: set[int] = set()
+    if h_abs >= 0:
+        acked.add(h_abs)
+    for i in range(32):
+        if ack_mask & (1 << i):
+            idx = h_abs - 1 - i
+            if idx >= 0:
+                acked.add(idx)
+    return acked
+
+
+def classify_pipe_frame(data: bytes) -> str:
+    """Classify an inbound frame during a pipe transfer by length + opcode.
+
+    Returns one of PIPE_FRAME_ACK / PIPE_FRAME_NACK / PIPE_FRAME_END_ACK /
+    PIPE_FRAME_END_NACK / PIPE_FRAME_OTHER. The more-specific (longer) ACK/NACK
+    forms are checked before the 2-byte END forms.
+
+    Note: pipe reads MUST use this rather than ``check_response_type`` — the
+    device→host NACK opcode 0xFF81 is not a member of ``CommandCode`` and would
+    raise there.
+    """
+    if len(data) >= 7 and data[0] == 0x00 and data[1] == 0x81:
+        return PIPE_FRAME_ACK
+    if len(data) >= 8 and data[0] == 0xFF and data[1] == 0x81:
+        return PIPE_FRAME_NACK
+    if len(data) >= 2 and data[0] == 0x00 and data[1] == 0x82:
+        return PIPE_FRAME_END_ACK
+    if len(data) >= 2 and data[0] == 0xFF and data[1] == 0x82:
+        return PIPE_FRAME_END_NACK
+    return PIPE_FRAME_OTHER

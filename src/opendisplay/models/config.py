@@ -340,6 +340,20 @@ class DisplayConfig:
         return bool(self.transmission_modes & 0x08)
 
     @property
+    def supports_pipe_write(self) -> bool:
+        """Check if display advertises sliding-window PIPE_WRITE (bit 0x10).
+
+        Hard pre-flight gate: uploads only attempt a 0x0080 probe when this bit
+        is set (full pipe in ``_execute_upload``; pipe-partial additionally in
+        ``_maybe_upload_partial``). Firmware echoes the STORED TLV, so a device
+        flashed with pipe-capable firmware but an older config will not set the
+        bit and stays on the legacy path until its config is updated. When the
+        gate passes, the 0x0080 negotiation remains authoritative for the
+        transfer parameters.
+        """
+        return bool(self.transmission_modes & 0x10)
+
+    @property
     def no_boot_text(self) -> bool:
         """Check if display should suppress boot text (TRANSMISSION_MODE_NO_BOOT_TEXT)."""
         return bool(self.transmission_modes & 0x80)
