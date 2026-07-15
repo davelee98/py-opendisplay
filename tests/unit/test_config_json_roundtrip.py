@@ -15,27 +15,29 @@ from opendisplay.models.config import (
     SystemConfig,
 )
 from opendisplay.models.config_json import config_from_json, config_to_json
+from opendisplay.protocol.config_serializer import serialize_power_option
 
 
 def _base_config(**overrides) -> GlobalConfig:
+    power = overrides.pop("power", None) or PowerOption(
+        power_mode=0,
+        battery_capacity_mah=b"\x00\x00\x00",
+        sleep_timeout_ms=0,
+        tx_power=0,
+        sleep_flags=0,
+        battery_sense_pin=0xFF,
+        battery_sense_enable_pin=0xFF,
+        battery_sense_flags=0,
+        capacity_estimator=0,
+        voltage_scaling_factor=0,
+        deep_sleep_current_ua=0,
+        deep_sleep_time_seconds=0,
+        reserved=b"\x00" * 10,
+    )
     return GlobalConfig(
         system=SystemConfig(ic_type=0, communication_modes=0, device_flags=0, pwr_pin=0xFF, reserved=b"\x00" * 15),
         manufacturer=ManufacturerData(manufacturer_id=0, board_type=0, board_revision=0, reserved=b"\x00" * 6),
-        power=PowerOption(
-            power_mode=0,
-            battery_capacity_mah=b"\x00\x00\x00",
-            sleep_timeout_ms=0,
-            tx_power=0,
-            sleep_flags=0,
-            battery_sense_pin=0xFF,
-            battery_sense_enable_pin=0xFF,
-            battery_sense_flags=0,
-            capacity_estimator=0,
-            voltage_scaling_factor=0,
-            deep_sleep_current_ua=0,
-            deep_sleep_time_seconds=0,
-            reserved=b"\x00" * 10,
-        ),
+        power=power,
         **overrides,
     )
 
@@ -96,6 +98,35 @@ def test_binary_input_pins_and_reserved_survive_json_roundtrip() -> None:
     b = back.binary_inputs[0]
     assert b.reserved_pins == bytes([21, 22, 23, 24, 25, 26, 27, 28])
     assert b.reserved == bytes(range(14))  # ADC thresholds / power_off blob preserved
+
+
+def test_power_option_reserved_survives_json_roundtrip() -> None:
+    """PowerOption reserved bytes (offsets 20-29: charger pins, min_wake_time_seconds,
+    screen_timeout_seconds) must survive binary -> JSON -> binary instead of being zeroed."""
+    # Non-zero sentinel occupying all 10 reserved bytes (wire offsets 20-29).
+    sentinel = bytes([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA])
+    power = PowerOption(
+        power_mode=0,
+        battery_capacity_mah=b"\x00\x00\x00",
+        sleep_timeout_ms=0,
+        tx_power=0,
+        sleep_flags=0,
+        battery_sense_pin=0xFF,
+        battery_sense_enable_pin=0xFF,
+        battery_sense_flags=0,
+        capacity_estimator=0,
+        voltage_scaling_factor=0,
+        deep_sleep_current_ua=0,
+        deep_sleep_time_seconds=0,
+        reserved=sentinel,
+    )
+    cfg = _base_config(displays=[_display()], power=power)
+
+    back = config_from_json(config_to_json(cfg))
+
+    packet = serialize_power_option(back.power)
+    assert len(packet) == 30
+    assert packet[20:30] == sentinel  # offsets 20-29 preserved, not zeroed
 
 
 def test_legacy_zero_reserved_still_parses() -> None:

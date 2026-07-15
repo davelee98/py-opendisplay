@@ -140,7 +140,7 @@ def config_to_json(config: GlobalConfig) -> dict[str, Any]:
                 "voltage_scaling_factor": f"0x{pwr.voltage_scaling_factor:x}",
                 "deep_sleep_current_ua": f"0x{pwr.deep_sleep_current_ua:x}",
                 "deep_sleep_time_seconds": f"0x{pwr.deep_sleep_time_seconds:x}",
-                "reserved": "0x0",
+                "reserved": _hex_bytes(pwr.reserved),
             },
         }
     )
@@ -506,7 +506,7 @@ def config_from_json(data: dict[str, Any]) -> GlobalConfig:
                 voltage_scaling_factor=_parse_int(fields.get("voltage_scaling_factor", "0")),
                 deep_sleep_current_ua=_parse_int(fields.get("deep_sleep_current_ua", "0")),
                 deep_sleep_time_seconds=_parse_int(fields.get("deep_sleep_time_seconds", "0")),
-                reserved=bytes(10),  # Fixed size
+                reserved=_parse_hex_bytes(fields.get("reserved", "0x0"), 10),
             )
 
         elif packet_id == 32:  # 0x20 = display
