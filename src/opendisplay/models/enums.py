@@ -159,6 +159,7 @@ class CapacityEstimator(IntEnum):
     LIFEPO4 = 2
     SUPERCAP = 3
     LITHIUM_PRIMARY = 4
+    SEEED_LI_ION = 5
 
 
 class LedType(IntEnum):
