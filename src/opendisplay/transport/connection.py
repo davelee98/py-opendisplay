@@ -420,11 +420,45 @@ class BLEConnection:
             self._write_no_response_supported,
         )
 
-        # Start notifications
-        await self._client.start_notify(
-            self._notification_characteristic,
-            self._notification_callback,
-        )
+        # Start notifications. On BlueZ, prefer the AcquireNotify (fd-socket) path
+        # over the default D-Bus StartNotify: StartNotify delivers notifications via
+        # the manager's per-device PropertiesChanged dispatch (the watcher registry),
+        # which can silently fail to route frames to the live client and is also the
+        # source of the read/notify duplicate-delivery hazard. AcquireNotify hands us
+        # a dedicated socket, bypassing that machinery entirely. bleak falls back to
+        # StartNotify if the characteristic lacks "NotifyAcquired"; we detect and log
+        # which path was actually taken below. On the ESP32 proxy backend the "bluez"
+        # kwarg is simply not applicable, so it is only passed for the BlueZ backend.
+        notify_backend = getattr(self._client, "_backend", None)
+        prefer_acquire_notify = notify_backend is not None and hasattr(notify_backend, "_acquire_mtu")
+        if prefer_acquire_notify:
+            # BlueZ backend — opt into AcquireNotify (use_start_notify=False).
+            await self._client.start_notify(
+                self._notification_characteristic,
+                self._notification_callback,
+                bluez={"use_start_notify": False},
+            )
+        else:
+            await self._client.start_notify(
+                self._notification_characteristic,
+                self._notification_callback,
+            )
+
+        # DEBUG: report which BlueZ delivery path bleak actually selected. bleak's
+        # AcquireNotify path populates the backend's _notification_fds with the
+        # characteristic's D-Bus path; StartNotify does not. If we asked for
+        # AcquireNotify but see StartNotify here, the char lacked "NotifyAcquired"
+        # and bleak fell back — which keeps the frames on the D-Bus dispatch path.
+        if _LOGGER.isEnabledFor(logging.DEBUG) and prefer_acquire_notify:
+            char_obj = getattr(self._notification_characteristic, "obj", None)
+            char_path = char_obj[0] if isinstance(char_obj, tuple) and char_obj else None
+            fds = getattr(notify_backend, "_notification_fds", None)
+            used_acquire = isinstance(fds, dict) and char_path in fds
+            _LOGGER.debug(
+                "[%s] notify delivery path: %s (requested AcquireNotify)",
+                self._log_id,
+                "AcquireNotify (fd socket)" if used_acquire else "StartNotify (D-Bus dispatch) — fell back",
+            )
 
         # DEBUG: re-log the MTU here (post start_notify) alongside the notify char,
         # so the negotiated payload ceiling sits right next to the subscription that
