@@ -201,6 +201,23 @@ class BLEConnection:
 
         _LOGGER.debug("Connected to %s", self.mac_address)
 
+        # DEBUG: negotiated ATT MTU. A GATT notification is a single ATT PDU and
+        # is NOT fragmentable: its max payload is mtu_size - 3. The firmware chunks
+        # config reads at ~100 bytes, so an MTU that never negotiated up from the
+        # 23-byte default (payload 20) means the device's notifications are dropped
+        # or truncated before they ever reach bleak — a silent, device-specific
+        # interrogate timeout. Log it as early as possible after connect.
+        try:
+            mtu = getattr(self._client, "mtu_size", None)
+        except Exception:  # noqa: BLE001 - diagnostic probe must never raise
+            mtu = None
+        _LOGGER.debug(
+            "[%s] negotiated ATT MTU=%s (max notification payload=%s bytes)",
+            self._log_id,
+            mtu,
+            (mtu - 3) if isinstance(mtu, int) else "?",
+        )
+
         # Start notifications
         await self._setup_notifications()
 
@@ -314,6 +331,24 @@ class BLEConnection:
 
         self._notification_characteristic = characteristics[0]
 
+        # DEBUG: enumerate what the GATT layout actually looks like on this device.
+        # A device whose notify source is NOT characteristics[0], or which exposes a
+        # split TX/RX pair, would take this same code path and silently subscribe to
+        # the wrong handle — producing exactly a "firmware sent, client saw nothing"
+        # interrogate timeout. List every characteristic + properties so a mismatch
+        # is visible in the field log.
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            for idx, ch in enumerate(characteristics):
+                _LOGGER.debug(
+                    "[%s] char[%d] uuid=%s handle=%s properties=%s%s",
+                    self._log_id,
+                    idx,
+                    getattr(ch, "uuid", "?"),
+                    getattr(ch, "handle", "?"),
+                    getattr(ch, "properties", []),
+                    " <- selected for notify+write" if idx == 0 else "",
+                )
+
         # Record whether the characteristic advertises Write Without Response so
         # writes can opt into it (0x71 data chunks) and gracefully fall back to
         # write-with-response on devices/stacks that don't support it.
@@ -330,7 +365,18 @@ class BLEConnection:
             self._notification_callback,
         )
 
-        _LOGGER.debug("Notifications started")
+        # DEBUG: re-log the MTU here (post start_notify) alongside the notify char,
+        # so the negotiated payload ceiling sits right next to the subscription that
+        # depends on it in the log.
+        mtu = getattr(self._client, "mtu_size", None)
+        _LOGGER.debug(
+            "[%s] Notifications started on uuid=%s handle=%s; ATT MTU=%s (max notify payload=%s bytes)",
+            self._log_id,
+            getattr(self._notification_characteristic, "uuid", "?"),
+            getattr(self._notification_characteristic, "handle", "?"),
+            mtu,
+            (mtu - 3) if isinstance(mtu, int) else "?",
+        )
 
         # DEBUG (BlueZ-only diagnostic): how many notification watchers BlueZ has
         # registered for this device. A count > 1 means a previous connection's

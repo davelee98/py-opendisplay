@@ -976,14 +976,30 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         Raises:
             ProtocolError: If interrogation fails
         """
-        _LOGGER.debug("Interrogating device %s", self.mac_address)
+        _LOGGER.debug("interrogate[%s]: >>> ENTER", self.mac_address)
 
         # Send read config command
+        _LOGGER.debug("interrogate[%s]: step 1/6 build_read_config_command()", self.mac_address)
         cmd = build_read_config_command()
+        _LOGGER.debug("interrogate[%s]: step 1/6 built cmd=%s (%d bytes)", self.mac_address, cmd.hex(), len(cmd))
+
+        _LOGGER.debug("interrogate[%s]: step 2/6 _write(cmd) — sending READ_CONFIG", self.mac_address)
         await self._write(cmd)
+        _LOGGER.debug("interrogate[%s]: step 2/6 _write returned (ATT write confirmed)", self.mac_address)
 
         # Read first chunk
+        _LOGGER.debug(
+            "interrogate[%s]: step 3/6 _read(first chunk, timeout=%.1fs) — awaiting notification",
+            self.mac_address,
+            self.TIMEOUT_FIRST_CHUNK,
+        )
         response = await self._read(self.TIMEOUT_FIRST_CHUNK)
+        _LOGGER.debug(
+            "interrogate[%s]: step 3/6 _read returned %d bytes: %s",
+            self.mac_address,
+            len(response),
+            response[:16].hex(),
+        )
 
         # Firmware answers a device-with-no-config with the 4-byte error frame
         # {0xFF, 0x40, 0x00, 0x00}. Without this check the {0x00,0x00} length
@@ -991,6 +1007,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         if len(response) == 4 and response[0] == 0xFF and response[1] == CommandCode.READ_CONFIG:
             raise ProtocolError("Device has no stored configuration (READ_CONFIG returned an error frame)")
 
+        _LOGGER.debug("interrogate[%s]: step 4/6 strip_command_echo()", self.mac_address)
         chunk_data = strip_command_echo(response, CommandCode.READ_CONFIG)
 
         # Parse first chunk header. Layout: [chunk_number:2 LE][total_length:2 LE][tlv...].
@@ -1020,6 +1037,13 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         # chunk making no progress) so we raise a typed error instead of hanging
         # or returning a partial config.
         while len(tlv_data) < total_length:
+            _LOGGER.debug(
+                "interrogate[%s]: loop _read(chunk, timeout=%.1fs) at %d/%d bytes",
+                self.mac_address,
+                self.TIMEOUT_CONFIG_CHUNK,
+                len(tlv_data),
+                total_length,
+            )
             try:
                 next_response = await self._read(self.TIMEOUT_CONFIG_CHUNK)
             except BLETimeoutError as err:
@@ -1065,7 +1089,9 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         _LOGGER.info("Received complete TLV data: %d bytes", len(tlv_data))
 
         # Parse complete config response (handles wrapper strip)
+        _LOGGER.debug("interrogate[%s]: step 5/6 parse_config_response(%d bytes)", self.mac_address, len(tlv_data))
         self._config = parse_config_response(bytes(tlv_data))
+        _LOGGER.debug("interrogate[%s]: step 6/6 _extract_capabilities_from_config()", self.mac_address)
         self._capabilities = self._extract_capabilities_from_config()
 
         _LOGGER.info(
@@ -1076,6 +1102,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             self._config.displays[0].rotation_enum,
         )
 
+        _LOGGER.debug("interrogate[%s]: <<< EXIT (success)", self.mac_address)
         return self._config
 
     @_serialized
