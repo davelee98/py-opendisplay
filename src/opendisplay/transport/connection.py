@@ -201,6 +201,18 @@ class BLEConnection:
 
         _LOGGER.debug("Connected to %s", self.mac_address)
 
+        # Force the ATT MTU exchange before notifications/interrogate. On a direct
+        # BlueZ link this is REQUIRED for correctness, not just tuning: BlueZ only
+        # negotiates the MTU up when bleak uses the AcquireWrite/AcquireNotify
+        # socket path. Our READ_CONFIG uses write-with-response (D-Bus WriteValue)
+        # and notify uses D-Bus StartNotify — neither triggers the exchange, so the
+        # MTU stays at the 23-byte default (20-byte payload). The firmware streams
+        # ~100-byte config-read notifications, which cannot fit a 20-byte payload
+        # and are silently dropped by the link — the device emits them, they never
+        # reach the client, and interrogate times out. Negotiating up front fixes
+        # every subsequent operation on the connection, including notifications.
+        await self._ensure_mtu_negotiated()
+
         # DEBUG: negotiated ATT MTU. A GATT notification is a single ATT PDU and
         # is NOT fragmentable: its max payload is mtu_size - 3. The firmware chunks
         # config reads at ~100 bytes, so an MTU that never negotiated up from the
@@ -308,6 +320,38 @@ class BLEConnection:
             return False
         # Guarded by callable() above; pylint can't infer through getattr.
         return bool(await clear_cache_fn())  # pylint: disable=not-callable
+
+    async def _ensure_mtu_negotiated(self) -> None:
+        """Force an ATT MTU exchange on BlueZ so large notifications can arrive.
+
+        bleak's BlueZ backend only negotiates the ATT MTU when it uses the
+        AcquireWrite/AcquireNotify socket path; the plain D-Bus WriteValue /
+        StartNotify path we use for READ_CONFIG leaves the MTU at the 23-byte
+        default (20-byte notification payload). Calling the backend's
+        ``_acquire_mtu()`` performs the exchange once (via AcquireWrite on the
+        write-without-response characteristic), and the negotiated MTU then applies
+        to every subsequent operation on the connection, including notifications.
+
+        BlueZ-only: the Bluetooth-proxy backend (ESP32/ESPHome) exposes no
+        ``_acquire_mtu`` and already negotiates a large MTU, so it is skipped.
+        Best-effort — never raises; a failed exchange just leaves the prior MTU.
+        """
+        client = self._client
+        if client is None:
+            return
+        backend = getattr(client, "_backend", None)
+        acquire = getattr(backend, "_acquire_mtu", None)
+        if acquire is None:
+            # Not the BlueZ backend (e.g. an ESP32 Bluetooth proxy) — nothing to do.
+            return
+        before = getattr(client, "mtu_size", None)
+        try:
+            await acquire()
+        except Exception as err:  # noqa: BLE001 - best-effort; keep connecting
+            _LOGGER.debug("[%s] forced ATT MTU exchange (AcquireWrite) failed: %s", self._log_id, err)
+            return
+        after = getattr(client, "mtu_size", None)
+        _LOGGER.debug("[%s] forced ATT MTU exchange: %s -> %s", self._log_id, before, after)
 
     async def _setup_notifications(self) -> None:
         """Set up BLE notifications for responses.
