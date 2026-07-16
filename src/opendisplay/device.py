@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, TypeVar, cast
 from epaper_dithering import ColorScheme, DitherMode, dither_image
 from PIL import Image
 
+from ._debug import decode_frame, format_frame
 from .crypto import (
     compute_challenge_response,
     compute_server_proof,
@@ -710,6 +711,11 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             IntegrityCheckError: If device returns 0xFF (decrypt/integrity check failed, command not executed)
         """
         raw = await self._conn.read_response(timeout=timeout)
+        # DEBUG: tie each application-level read to the frame's nonce counter so a
+        # duplicate/second-stream frame is identifiable end-to-end.
+        treated_encrypted = self._session_key is not None and len(raw) >= self._ENCRYPTED_RESPONSE_MIN_LEN
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug("_read: %s treated_encrypted=%s", format_frame(raw), treated_encrypted)
         if self._session_key is not None:
             # Encrypted packets are at least cmd(2)+nonce(16)+payload(1)+tag(12)=31 bytes.
             # Shorter responses are sent unencrypted by the firmware even during a session:
@@ -717,6 +723,8 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             # like {0xFF, 0xFF} (compressed buffer unavailable) are also unencrypted.
             if len(raw) >= self._ENCRYPTED_RESPONSE_MIN_LEN:
                 cmd_code, payload = decrypt_response(self._session_key, raw)
+                if _LOGGER.isEnabledFor(logging.DEBUG):
+                    _LOGGER.debug("_read: decrypted cmd=0x%04x payload_len=%d", cmd_code, len(payload))
                 return cmd_code.to_bytes(2, "big") + payload
         # Firmware returns [cmd_high, cmd_low, 0xFE] (3 bytes) when a command
         # requires authentication but no session is active.
@@ -960,11 +968,26 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
 
         chunk_data = strip_command_echo(response, CommandCode.READ_CONFIG)
 
-        # Parse first chunk header
+        # Parse first chunk header. Layout: [chunk_number:2 LE][total_length:2 LE][tlv...].
+        chunk_number = int.from_bytes(chunk_data[0:2], "little")
         total_length = int.from_bytes(chunk_data[2:4], "little")
         tlv_data = bytearray(chunk_data[4:])
+        # DEBUG: track the device's per-chunk counter so a repeat/regression/gap
+        # (duplicate delivery or a second stream) is flagged against the expected next.
+        expected_chunk = chunk_number + 1
 
         _LOGGER.debug("First chunk: %d bytes, total length: %d", len(chunk_data), total_length)
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "interrogate first chunk: chunk_number=%d header=%s total_length=%d(from chunk_data[2:4] LE) "
+                "payload_len=%d cumulative=%d/%d",
+                chunk_number,
+                chunk_data[0:4].hex(),
+                total_length,
+                len(chunk_data) - 4,
+                len(tlv_data),
+                total_length,
+            )
 
         # Read remaining chunks. Firmware caps config-read chunks, so a broken or
         # older firmware can stop sending before `total_length` is reached. Guard
@@ -980,8 +1003,20 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
                 ) from err
             next_chunk_data = strip_command_echo(next_response, CommandCode.READ_CONFIG)
 
-            # Skip chunk number field (2 bytes) and append data
+            # Read (then skip) the 2-byte chunk-number field and append data.
+            chunk_number = int.from_bytes(next_chunk_data[0:2], "little")
             chunk_payload = next_chunk_data[2:]
+            # DEBUG: flag any chunk_number that is not the expected next one — a
+            # repeat (duplicate delivery), a regression, or a gap (second stream).
+            if chunk_number != expected_chunk:
+                _LOGGER.warning(
+                    "interrogate chunk_number anomaly: got %d, expected %d at %d/%d bytes (log-only)",
+                    chunk_number,
+                    expected_chunk,
+                    len(tlv_data),
+                    total_length,
+                )
+            expected_chunk = chunk_number + 1
             if not chunk_payload:
                 raise TruncatedConfigError(
                     f"Config read stalled: device sent an empty chunk at {len(tlv_data)}/{total_length} bytes"
@@ -993,6 +1028,14 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
                 len(tlv_data),
                 total_length,
             )
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(
+                    "interrogate chunk: chunk_number=%d payload_len=%d cumulative=%d/%d",
+                    chunk_number,
+                    len(chunk_payload),
+                    len(tlv_data),
+                    total_length,
+                )
 
         _LOGGER.info("Received complete TLV data: %d bytes", len(tlv_data))
 
@@ -1025,6 +1068,18 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
 
         # Read response
         response = await self._conn.read_response(timeout=self.TIMEOUT_ACK)
+
+        # DEBUG: fully identify the frame consumed as the firmware-version response.
+        # This read bypasses _read()/decryption, so a poisoning stale config frame
+        # (an encrypted READ_CONFIG chunk with its own nonce counter) that leaked
+        # into the queue is surfaced here by its nonce counter before parsing.
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            info = decode_frame(response)
+            _LOGGER.debug(
+                "read_firmware_version response: %s%s",
+                format_frame(response),
+                f" (encrypted config-frame nonce ctr={info.response_counter})" if info.is_encrypted else "",
+            )
 
         # Parse version (includes SHA hash)
         self._fw_version = parse_firmware_version(response)

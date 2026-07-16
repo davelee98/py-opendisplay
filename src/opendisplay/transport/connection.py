@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from bleak import BleakClient, BleakScanner
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
+from .._debug import format_frame
 from ..exceptions import BLEConnectionError, BLETimeoutError
 from ..protocol import SERVICE_UUID
 
@@ -64,6 +65,12 @@ class BLEConnection:
 
         self._client: BleakClient | None = None
         self._notification_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        # DEBUG instrumentation: short, stable per-connection correlation id and a
+        # monotonic receive sequence stamped on every inbound notification. id() is
+        # process-unique and deterministic enough for a single repro run — avoid
+        # uuid/random which would perturb log determinism.
+        self._log_id = f"{id(self) & 0xFFFF:04x}"
+        self._rx_seq = 0
         self._notification_characteristic: BleakGATTCharacteristic | None = None
         # Whether the command characteristic advertises Write Without Response.
         # Set during notification setup; used to safely enable/disable WNR writes.
@@ -120,11 +127,14 @@ class BLEConnection:
                     await self._clear_cache_and_drop()
                     raise BLEConnectionError(f"Failed to connect: {e}") from e
                 _LOGGER.debug(
-                    "Connect to %s failed (%s); clearing GATT cache and retrying (attempt %d/%d)",
+                    "[%s] Connect to %s failed (%s); clearing GATT cache and retrying "
+                    "(attempt %d/%d, use_services_cache=%s)",
+                    self._log_id,
                     self.mac_address,
                     e,
                     attempt + 1,
                     MAX_CACHE_RETRIES + 1,
+                    use_cache,
                 )
                 # Clears the proxy cache AND disconnects, so the next iteration
                 # rediscovers from scratch and we never keep a stale connection.
@@ -203,11 +213,15 @@ class BLEConnection:
             try:
                 await clear()  # pylint: disable=not-callable
             except Exception as err:  # noqa: BLE001 - best-effort
-                _LOGGER.debug("clear_cache during connect retry failed: %s", err)
+                # Elevated to WARNING: a failed cache-clear here is the precondition
+                # for a leaked BlueZ notification watcher (stale-frame source).
+                _LOGGER.warning("[%s] clear_cache during connect retry failed: %s", self._log_id, err)
         try:
             await self._client.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as err:  # noqa: BLE001
+            # Elevated from a silent swallow to WARNING: a disconnect that fails
+            # here leaves the BlueZ watcher registered — the watcher-leak precondition.
+            _LOGGER.warning("[%s] disconnect during connect retry failed: %s", self._log_id, err)
         self._client = None
 
     async def disconnect(self) -> None:
@@ -288,6 +302,41 @@ class BLEConnection:
 
         _LOGGER.debug("Notifications started")
 
+        # DEBUG (BlueZ-only diagnostic): how many notification watchers BlueZ has
+        # registered for this device. A count > 1 means a previous connection's
+        # watcher leaked and is still delivering frames — the root cause of stray
+        # "stale" notifications and duplicate delivery. Best-effort; never raises.
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            watcher_count = await self._debug_watcher_count()
+            _LOGGER.debug("[%s] BlueZ device watcher count: %s", self._log_id, watcher_count)
+
+    async def _debug_watcher_count(self) -> int | None:
+        """Return BlueZ's registered notification-watcher count for this device.
+
+        BlueZ-only diagnostic probe: reaches the global BlueZ D-Bus manager and
+        counts the watchers registered for this device's object path. More than
+        one watcher means a prior connection leaked its watcher and is still
+        delivering notifications (the watcher-leak that produces stray "stale"
+        frames and duplicate delivery). Returns None on any other backend (e.g. a
+        Bluetooth-proxy client) or if internals are unavailable. Never raises.
+        """
+        try:
+            from bleak.backends.bluezdbus.manager import (  # noqa: PLC0415 - lazy, diagnostic-only
+                get_global_bluez_manager,
+            )
+
+            backend = getattr(self._client, "_backend", None)
+            device_path = getattr(backend, "_device_path", None)
+            if device_path is None:
+                return None
+            mgr = await get_global_bluez_manager()
+            watchers = getattr(mgr, "_device_watchers", None)
+            if watchers is None:
+                return None
+            return len(watchers.get(device_path, ()))
+        except Exception:  # noqa: BLE001 - diagnostic probe must never raise
+            return None
+
     def _on_disconnect(self, _client: BleakClient) -> None:
         """Handle an unexpected or graceful BLE disconnect.
 
@@ -309,7 +358,20 @@ class BLEConnection:
             data: Notification data
         """
         # Put notification in queue for processing
-        self._notification_queue.put_nowait(bytes(data))
+        raw = bytes(data)
+        self._notification_queue.put_nowait(raw)
+        # DEBUG: earliest raw observation — the primary duplicate detector. rx_seq
+        # gives per-notification identity; format_frame surfaces the per-frame
+        # response nonce counter (a repeat counter == duplicate delivery).
+        self._rx_seq += 1
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "[%s] rx#%d %s qsize=%d",
+                self._log_id,
+                self._rx_seq,
+                format_frame(raw),
+                self._notification_queue.qsize(),
+            )
 
     def drain_notifications(self) -> int:
         """Discard any queued notifications and return how many were dropped.
@@ -322,12 +384,17 @@ class BLEConnection:
         queue is already empty here, so this is a no-op.
         """
         dropped = 0
+        debug = _LOGGER.isEnabledFor(logging.DEBUG)
         while True:
             try:
-                self._notification_queue.get_nowait()
+                stale = self._notification_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
             dropped += 1
+            # DEBUG: identify each discarded frame (nonce counter included) so a
+            # stray frame can be matched back to the rx# that first queued it.
+            if debug:
+                _LOGGER.debug("[%s] draining stale #%d %s", self._log_id, dropped, format_frame(stale))
         if dropped:
             _LOGGER.warning("Discarded %d stale notification(s) before command", dropped)
         return dropped
