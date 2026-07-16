@@ -131,6 +131,16 @@ class NfcIcType(IntEnum):
     TNB132M = 1
 
 
+class NfcRecordType(IntEnum):
+    """NDEF record types for the NFC write endpoint (command 0x0083)."""
+
+    TEXT = 0
+    URI = 1
+    WELL_KNOWN_RAW = 2
+    MIME = 3
+    RAW_NDEF = 4
+
+
 class FlashIcType(IntEnum):
     """External flash IC types (config packet 0x2b)."""
 
