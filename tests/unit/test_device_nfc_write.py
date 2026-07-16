@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from opendisplay import OpenDisplayDevice
+from opendisplay.crypto import encrypt_command
 from opendisplay.exceptions import BLETimeoutError, InvalidResponseError, NfcNotSupportedError, NfcWriteError
 from opendisplay.models.enums import NfcRecordType
 
@@ -222,6 +223,59 @@ async def test_write_nfc_mime_type_too_long_rejected() -> None:
 
     with pytest.raises(ValueError):
         await device.write_nfc_mime("x" * 256, b"body")
+
+
+@pytest.mark.asyncio
+async def test_write_nfc_inline_happy_path_encrypted_session() -> None:
+    """An encrypted OK frame from the device must be decrypted and normalized correctly.
+
+    _read() decrypts an encrypted response and returns cmd_code.to_bytes(2, "big") + payload,
+    i.e. exactly the same shape as the plaintext ack (b"\\x00\\x83\\x81"). This locks in that
+    normalization contract for the encrypted-session code path, which no other test exercises.
+    """
+    device = OpenDisplayDevice(mac_address="AA:BB:CC:DD:EE:FF")
+    session_key = bytes(range(16))
+    session_id = bytes(range(8))
+    device._session_key = session_key
+    device._session_id = session_id
+    device._nonce_counter = 0
+
+    # Build a genuinely encrypted device-to-host OK response using the library's own
+    # encrypt routine. The wire format (cmd(2) + nonce(16) + ciphertext + tag(12)) is
+    # identical in both directions, as proven by TestEncryptDecryptCommand.test_round_trip
+    # in test_crypto.py, so reusing encrypt_command here is not a fragile reimplementation.
+    encrypted_ok = encrypt_command(session_key, session_id, counter=1, cmd=b"\x00\x83", payload=b"\x81")
+
+    fake = _FakeConnection(response=encrypted_ok)
+    device._connection = fake
+
+    await device.write_nfc(NfcRecordType.TEXT, b"hello")
+
+    # _write() also encrypts outgoing frames once a session key is set, so the frame
+    # recorded here is ciphertext too; what this test locks in is that the encrypted
+    # *response* was accepted and decrypted without error.
+    assert len(fake.written) == 1
+
+
+@pytest.mark.asyncio
+async def test_write_nfc_error_frame_plaintext_during_encrypted_session() -> None:
+    """A plaintext firmware error frame must still raise NfcWriteError even with a session key set.
+
+    Error frames {0xFF, 0x83, 0xFF, err} are only 4 bytes -- shorter than the 31-byte
+    encrypted-frame minimum -- so the firmware sends them unencrypted even mid-session,
+    and _read() must not attempt to decrypt them.
+    """
+    device = OpenDisplayDevice(mac_address="AA:BB:CC:DD:EE:FF")
+    device._session_key = bytes(range(16))
+    device._session_id = bytes(range(8))
+    device._nonce_counter = 0
+
+    fake = _FakeConnection(response=b"\xff\x83\xff\x03")
+    device._connection = fake
+
+    with pytest.raises(NfcWriteError) as exc_info:
+        await device.write_nfc(NfcRecordType.TEXT, b"hello")
+    assert exc_info.value.error_code == 3
 
 
 @pytest.mark.asyncio
