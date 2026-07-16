@@ -20,6 +20,16 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Loaded package version, stamped into the connect log so the field log itself
+# proves which build is running (the manifest pins a branch git URL, so a stale
+# module can silently survive a "reinstall" until the HA process restarts).
+try:
+    from importlib.metadata import version as _pkg_version
+
+    _PYOD_VERSION = _pkg_version("py-opendisplay")
+except Exception:  # noqa: BLE001 - version stamp must never break a connection
+    _PYOD_VERSION = "unknown"
+
 # Bounded number of clear-cache-and-rediscover retries on a stale-GATT-cache
 # failure: 1 initial attempt + up to MAX_CACHE_RETRIES retries. Kept small so a
 # genuinely broken link drops instead of looping.
@@ -168,8 +178,9 @@ class BLEConnection:
     async def _attempt_connect(self, *, use_services_cache: bool) -> None:
         """Resolve the device, establish a connection, and set up notifications."""
         _LOGGER.debug(
-            "Connecting to %s with bleak-retry-connector (max_attempts=%d, use_services_cache=%s)",
+            "Connecting to %s with bleak-retry-connector (py-opendisplay=%s, max_attempts=%d, use_services_cache=%s)",
             self.mac_address,
+            _PYOD_VERSION,
             self.max_attempts,
             use_services_cache,
         )
