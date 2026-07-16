@@ -338,11 +338,17 @@ class BLEConnection:
         """
         client = self._client
         if client is None:
+            _LOGGER.debug("[%s] MTU exchange skipped: no client", self._log_id)
             return
         backend = getattr(client, "_backend", None)
         acquire = getattr(backend, "_acquire_mtu", None)
         if acquire is None:
             # Not the BlueZ backend (e.g. an ESP32 Bluetooth proxy) — nothing to do.
+            _LOGGER.debug(
+                "[%s] MTU exchange skipped: backend %s has no _acquire_mtu (proxy/other)",
+                self._log_id,
+                type(backend).__name__,
+            )
             return
         before = getattr(client, "mtu_size", None)
         try:

@@ -891,7 +891,7 @@ wheels = [
 
 [[package]]
 name = "py-opendisplay"
-version = "7.12.0+debug.5"
+version = "7.12.0+debug.6"
 source = { editable = "." }
 dependencies = [
     { name = "bleak" },
