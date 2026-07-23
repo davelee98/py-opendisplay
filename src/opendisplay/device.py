@@ -435,7 +435,13 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
     TIMEOUT_CONFIG_CHUNK = 2.0  # Subsequent config read chunks (interrogate)
     TIMEOUT_ACK = 5.0  # Command acknowledgments
     TIMEOUT_NFC_WRITE = 15.0  # NFC EEPROM commit (inline write / chunk end): slow I2C work
-    TIMEOUT_UNCOMPRESSED_DATA_ACK = 90.0  # Uncompressed DATA: bbepWriteData() blocks SPI on Spectra/ACeP (~60s max)
+    # DIRECT_WRITE DATA (0x0071), both protocols. The ACK follows the firmware's
+    # bbepWriteData() call, which blocks SPI for up to ~60s on Spectra/ACeP. The
+    # compressed path does that same blocking write plus an inflate — one 4KB frame
+    # expands to ~90KB of panel data — so it needs the budget at least as much as
+    # the uncompressed one. It previously fell through to TIMEOUT_ACK (5s), which
+    # made a healthy-but-slow transfer look dead mid-stream.
+    TIMEOUT_DIRECT_WRITE_DATA_ACK = 90.0
     TIMEOUT_UNCOMPRESSED_END_ACK = 90.0  # Uncompressed END: some firmware variants refresh before replying (~60s max)
     TIMEOUT_COMPRESSED_END_ACK = 90.0  # Compressed END: decompression + full SPI write to IC (~60s on Spectra/ACeP)
     TIMEOUT_REFRESH = 90.0  # Display refresh (firmware spec: up to 60s)
@@ -1891,7 +1897,8 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
 
         Encrypted BLE session -> ENCRYPTED_CHUNK_SIZE (154); plain BLE ->
         CHUNK_SIZE (230); a large-frame LAN transport -> ``max_frame - 2`` (the
-        2-byte opcode header), e.g. 4094 for a 4096-byte LAN frame.
+        2-byte opcode header), e.g. 4092 for a 4094-byte payload / 4096-byte
+        wire frame.
         """
         if self._session_key is not None:
             return ENCRYPTED_CHUNK_SIZE
@@ -2244,10 +2251,12 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         auto_completed = False
         if use_compression:
             if remaining_compressed:
-                auto_completed = await self._send_data_chunks(remaining_compressed, progress_callback)
+                auto_completed = await self._send_data_chunks(
+                    remaining_compressed, progress_callback, chunk_timeout=self.TIMEOUT_DIRECT_WRITE_DATA_ACK
+                )
         else:
             auto_completed = await self._send_data_chunks(
-                image_data, progress_callback, chunk_timeout=self.TIMEOUT_UNCOMPRESSED_DATA_ACK
+                image_data, progress_callback, chunk_timeout=self.TIMEOUT_DIRECT_WRITE_DATA_ACK
             )
 
         # 4. Send END (unless device auto-triggered refresh), then wait for 0x73
@@ -2295,8 +2304,12 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         Raises:
             ProtocolError: If device responds with an unexpected code
             BLETimeoutError: If no response within chunk_timeout
+
+        ``chunk_timeout`` defaults to the DATA-ACK budget rather than the general
+        TIMEOUT_ACK: every 0x0071 ACK waits on a blocking panel write, so the 5s
+        command-ack budget is never right here.
         """
-        timeout = chunk_timeout if chunk_timeout is not None else self.TIMEOUT_ACK
+        timeout = chunk_timeout if chunk_timeout is not None else self.TIMEOUT_DIRECT_WRITE_DATA_ACK
         bytes_sent = 0
         chunks_sent = 0
 

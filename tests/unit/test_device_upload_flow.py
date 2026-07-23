@@ -189,7 +189,7 @@ async def test_uncompressed_data_chunks_use_90s_timeout() -> None:
     device._connection = fake
     await device._execute_upload(image_data, RefreshMode.FULL, use_compression=False)
     assert fake.timeouts[0] == device.TIMEOUT_FIRST_CHUNK
-    assert fake.timeouts[1] == device.TIMEOUT_UNCOMPRESSED_DATA_ACK
+    assert fake.timeouts[1] == device.TIMEOUT_DIRECT_WRITE_DATA_ACK
     assert fake.timeouts[2] == device.TIMEOUT_UNCOMPRESSED_END_ACK
     assert fake.timeouts[3] == device.TIMEOUT_REFRESH
 
@@ -249,8 +249,14 @@ async def test_compressed_end_ack_uses_90s_timeout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compressed_data_chunk_acks_use_5s_timeout() -> None:
-    """Compressed DATA chunk ACKs use TIMEOUT_ACK (5s) — data is buffered, not written to SPI."""
+async def test_compressed_data_chunk_acks_use_same_timeout_as_uncompressed() -> None:
+    """Compressed DATA chunk ACKs get the full 90s DATA budget, same as uncompressed.
+
+    Regression: they used to fall through to TIMEOUT_ACK (5s) on the theory that a
+    compressed chunk is only buffered. It is not — firmware inflates it and streams
+    the result to the panel inside the ACK, so one 4KB frame can mean ~90KB of
+    blocking SPI. The 5s budget aborted healthy transfers mid-stream.
+    """
     image_data = b"\x00" * 500
     # 300B > 194B (MAX_START_PAYLOAD - 6) → START gets 194B, remaining 106B sent as DATA chunk
     compressed = b"\xff" * 300
@@ -264,8 +270,8 @@ async def test_compressed_data_chunk_acks_use_5s_timeout() -> None:
         compressed_data=compressed,
         uncompressed_size=len(image_data),
     )
-    # Timeouts: [FIRST_CHUNK, ACK (data), COMPRESSED_END_ACK, REFRESH]
-    assert fake.timeouts[1] == device.TIMEOUT_ACK
+    # Timeouts: [FIRST_CHUNK, DIRECT_WRITE_DATA_ACK, COMPRESSED_END_ACK, REFRESH]
+    assert fake.timeouts[1] == device.TIMEOUT_DIRECT_WRITE_DATA_ACK
     assert fake.timeouts[2] == device.TIMEOUT_COMPRESSED_END_ACK
 
 
@@ -380,8 +386,8 @@ async def test_after_fallback_data_chunks_use_uncompressed_timeout() -> None:
         compressed_data=compressed,
         uncompressed_size=len(image_data),
     )
-    # timeouts: [FIRST_CHUNK(err), FIRST_CHUNK(retry), UNCOMPRESSED_DATA_ACK, ACK, REFRESH]
-    assert device.TIMEOUT_UNCOMPRESSED_DATA_ACK in fake.timeouts
+    # timeouts: [FIRST_CHUNK(err), FIRST_CHUNK(retry), DIRECT_WRITE_DATA_ACK, ACK, REFRESH]
+    assert device.TIMEOUT_DIRECT_WRITE_DATA_ACK in fake.timeouts
 
 
 # ─── _dispatch_upload: ZIPXL zlib window and size semantics ──────────────────

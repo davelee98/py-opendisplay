@@ -102,9 +102,9 @@ async def test_read_partial_frame_reassembles() -> None:
     await feeder
 
 
-async def test_read_large_4096_frame() -> None:
+async def test_read_large_max_payload_frame() -> None:
     reader = asyncio.StreamReader()
-    payload = bytes(range(256)) * 16  # exactly 4096 bytes
+    payload = (bytes(range(256)) * 16)[:OD_LAN_MAX_PAYLOAD]  # exactly 4094 bytes
     assert len(payload) == OD_LAN_MAX_PAYLOAD
     reader.feed_data(_framed(payload))
     t = _wire(reader)

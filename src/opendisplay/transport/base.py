@@ -24,7 +24,8 @@ class Transport(Protocol):
     """
 
     #: Maximum application payload the link can carry in a single frame. BLE is
-    #: capped at the HA GATT write ceiling (244); LAN allows up to 4096.
+    #: capped at the HA GATT write ceiling (244); LAN allows up to 4094
+    #: (a 4096-byte wire frame including the 2-byte length prefix).
     max_frame: int
 
     #: Human-readable device name, if known (BLE advertised name); None on LAN.

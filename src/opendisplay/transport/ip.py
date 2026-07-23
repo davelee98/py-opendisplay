@@ -45,7 +45,8 @@ class TcpTransport:
             ``tls=True``; ignored otherwise.
     """
 
-    #: LAN frame payload ceiling — matches OD_LAN_MAX_PAYLOAD.
+    #: LAN frame payload ceiling — OD_LAN_MAX_PAYLOAD (4094), keeping the wire
+    #: frame (2-byte len prefix + payload) within OD_LAN_MAX_FRAME (4096).
     max_frame: int = OD_LAN_MAX_PAYLOAD
     #: TCP writes are always reliable; there is no write-without-response.
     supports_write_without_response: bool = False

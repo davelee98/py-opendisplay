@@ -56,11 +56,13 @@ RESPONSE_HIGH_BIT_FLAG = 0x8000  # High bit set in response codes indicates ACK
 # Network transport (LAN) constants — mirror opendisplay_protocol.h SECTION 9
 # (protocol 2.2). The plaintext port is the configured WifiConfig.server_port
 # (this default when 0); the TLS-PSK port is derived as server_port + 1
-# (== OD_LAN_TCP_PORT + 1). Frames are [len:2 LE][payload]; valid payload length
+# (== OD_LAN_TCP_PORT + 1). Frames are [len:2 LE][payload]; the complete WIRE
+# frame (prefix + payload) is capped at OD_LAN_MAX_FRAME, so valid payload length
 # is 1..OD_LAN_MAX_PAYLOAD (0 invalid; > max MUST be rejected + connection dropped).
 OD_LAN_TCP_PORT = 2446  # DEFAULT plaintext port
 OD_LAN_TLS_PORT = 2447  # DEFAULT TLS-PSK port (== OD_LAN_TCP_PORT + 1)
-OD_LAN_MAX_PAYLOAD = 4096  # max payload bytes after the [len:2 LE] frame prefix
+OD_LAN_MAX_FRAME = 4096  # max WIRE frame: [len:2 LE] prefix + payload, inclusive
+OD_LAN_MAX_PAYLOAD = OD_LAN_MAX_FRAME - 2  # max payload bytes (4094) after the prefix
 OD_LAN_MDNS_SERVICE = "_opendisplay._tcp"  # DNS-SD service; FQDN "_opendisplay._tcp.local."
 OD_LAN_READ_TIMEOUT_S = 30  # idle timeout: server drops a client after this many idle seconds
 
@@ -271,7 +273,8 @@ def build_direct_write_data_command(chunk_data: bytes, max_data_len: int = CHUNK
         chunk_data: Image data chunk (max ``max_data_len`` bytes)
         max_data_len: Maximum allowed chunk length. Defaults to ``CHUNK_SIZE``
             (230) for BLE. The LAN transport passes a larger cap (up to
-            ``OD_LAN_MAX_PAYLOAD - 2`` = 4094) so large TCP frames pass.
+            ``OD_LAN_MAX_PAYLOAD - 2`` = 4092, keeping the wire frame within
+            ``OD_LAN_MAX_FRAME`` = 4096) so large TCP frames pass.
 
     Returns:
         Command bytes: 0x0071 + chunk_data
