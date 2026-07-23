@@ -107,6 +107,8 @@ class ScriptedConn:
     count at each read (for window-invariant assertions).
     """
 
+    max_frame: int = 244  # Transport structural conformance (BLE GATT ceiling)
+
     def __init__(self, responses: list) -> None:
         self.written: list[bytes] = []
         self.write_responses: list[bool] = []
@@ -691,7 +693,7 @@ async def test_disconnect_resets_pipe_cache() -> None:
     dev._pipe_probed = True
     dev._pipe_supported = False
     dev._pipe_params = PipeParams(8, 4, 244, True, False)
-    dev._on_ble_disconnect()
+    dev._on_disconnect()
     assert dev._pipe_probed is False
     assert dev._pipe_supported is False
     assert dev._pipe_params is None

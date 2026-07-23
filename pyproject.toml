@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-opendisplay"
-version = "7.13.0"
+version = "8.0.0"
 description = "Python library for OpenDisplay BLE e-paper displays"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 authors = [
     {name = "g4bri3lDev", email = "admin@g4bri3l.de"}
 ]
@@ -19,9 +19,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Hardware",
@@ -41,6 +38,9 @@ dependencies = [
 [project.optional-dependencies]
 cli = [
     "rich>=13.0.0",
+]
+wifi = [
+    "zeroconf>=0.132.0",
 ]
 nrf-ota = [
     "nrf-ota>=0.4.0",
@@ -69,13 +69,13 @@ include = ["src/opendisplay/py.typed"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
@@ -95,8 +95,8 @@ argument-rgx = "^[a-zA-Z_][a-zA-Z0-9_]*$"
 attr-rgx = "^[a-zA-Z_][a-zA-Z0-9_]*$"
 
 [tool.pylint.design]
-max-args = 16
-max-positional-arguments = 16
+max-args = 20              # OpenDisplayDevice adds transport/host/port/tls/psk addressing params
+max-positional-arguments = 20
 max-locals = 28              # _build_info_tree renders a complex tree with many conditional vars
 max-attributes = 22          # config dataclasses have many fields by nature
 max-branches = 25

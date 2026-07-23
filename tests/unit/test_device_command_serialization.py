@@ -64,12 +64,12 @@ def test_clear_session_resets_all_session_state() -> None:
     assert device._auth_time is None
 
 
-def test_on_ble_disconnect_clears_session() -> None:
+def test_on_disconnect_clears_session() -> None:
     device = _make_device()
     device._session_key = b"k" * 16
     device._nonce_counter = 9
 
-    device._on_ble_disconnect()
+    device._on_disconnect()
 
     assert device._session_key is None
     assert device._nonce_counter == 0

@@ -53,6 +53,17 @@ SERVICE_UUID = "00002446-0000-1000-8000-00805F9B34FB"
 MANUFACTURER_ID = 0x2446  # 9286 decimal
 RESPONSE_HIGH_BIT_FLAG = 0x8000  # High bit set in response codes indicates ACK
 
+# Network transport (LAN) constants — mirror opendisplay_protocol.h SECTION 9
+# (protocol 2.2). The plaintext port is the configured WifiConfig.server_port
+# (this default when 0); the TLS-PSK port is derived as server_port + 1
+# (== OD_LAN_TCP_PORT + 1). Frames are [len:2 LE][payload]; valid payload length
+# is 1..OD_LAN_MAX_PAYLOAD (0 invalid; > max MUST be rejected + connection dropped).
+OD_LAN_TCP_PORT = 2446  # DEFAULT plaintext port
+OD_LAN_TLS_PORT = 2447  # DEFAULT TLS-PSK port (== OD_LAN_TCP_PORT + 1)
+OD_LAN_MAX_PAYLOAD = 4096  # max payload bytes after the [len:2 LE] frame prefix
+OD_LAN_MDNS_SERVICE = "_opendisplay._tcp"  # DNS-SD service; FQDN "_opendisplay._tcp.local."
+OD_LAN_READ_TIMEOUT_S = 30  # idle timeout: server drops a client after this many idle seconds
+
 # Chunking constants
 CHUNK_SIZE = 230  # Maximum data bytes per chunk (unencrypted)
 ENCRYPTED_CHUNK_SIZE = 154  # Maximum data bytes per chunk when session is active
@@ -253,22 +264,25 @@ def build_direct_write_partial_start(
     return cmd + fixed + initial, remaining
 
 
-def build_direct_write_data_command(chunk_data: bytes) -> bytes:
+def build_direct_write_data_command(chunk_data: bytes, max_data_len: int = CHUNK_SIZE) -> bytes:
     """Build command to send image data chunk.
 
     Args:
-        chunk_data: Image data chunk (max CHUNK_SIZE bytes)
+        chunk_data: Image data chunk (max ``max_data_len`` bytes)
+        max_data_len: Maximum allowed chunk length. Defaults to ``CHUNK_SIZE``
+            (230) for BLE. The LAN transport passes a larger cap (up to
+            ``OD_LAN_MAX_PAYLOAD - 2`` = 4094) so large TCP frames pass.
 
     Returns:
         Command bytes: 0x0071 + chunk_data
 
     Format:
-        [cmd:2][data:230]
+        [cmd:2][data:N]
         - cmd: 0x0071 (big-endian)
         - data: Image data chunk
     """
-    if len(chunk_data) > CHUNK_SIZE:
-        raise ValueError(f"Chunk size {len(chunk_data)} exceeds maximum {CHUNK_SIZE}")
+    if len(chunk_data) > max_data_len:
+        raise ValueError(f"Chunk size {len(chunk_data)} exceeds maximum {max_data_len}")
 
     cmd = CommandCode.DIRECT_WRITE_DATA.to_bytes(2, byteorder="big")
     return cmd + chunk_data

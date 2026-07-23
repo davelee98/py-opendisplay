@@ -33,7 +33,12 @@ class BLEConnection:
     - Service caching for faster reconnections
     - Context manager for automatic cleanup
     - Notification queue for response handling
+
+    Satisfies the :class:`~opendisplay.transport.base.Transport` interface.
     """
+
+    #: Application payload ceiling per frame — the HA native GATT write ceiling.
+    max_frame: int = 244
 
     def __init__(
         self,
@@ -437,3 +442,12 @@ class BLEConnection:
     def is_connected(self) -> bool:
         """Check if currently connected to device."""
         return self._client is not None and self._client.is_connected
+
+    @property
+    def supports_write_without_response(self) -> bool:
+        """Whether the command characteristic advertises Write Without Response.
+
+        Set during notification setup; used to safely opt 0x71 data chunks into
+        unacknowledged writes and fall back otherwise.
+        """
+        return self._write_no_response_supported

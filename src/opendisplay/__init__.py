@@ -8,6 +8,7 @@ from epaper_dithering import ColorScheme, DitherMode
 from .battery import voltage_to_percent
 from .device import OpenDisplayDevice, prepare_image
 from .discovery import discover_devices, discover_devices_with_adv
+from .discovery_ip import IpDeviceInfo, discover_ip_devices
 from .exceptions import (
     AuthenticationError,
     AuthenticationFailedError,
@@ -20,7 +21,9 @@ from .exceptions import (
     InvalidResponseError,
     NfcNotSupportedError,
     NfcWriteError,
+    OpenDisplayConnectionError,
     OpenDisplayError,
+    OpenDisplayTimeoutError,
     OTAError,
     OTANotSupportedError,
     ProtocolError,
@@ -87,6 +90,7 @@ from .models.led_flash import LedFlashConfig, LedFlashStep
 from .ota import find_nrf_dfu_device, perform_nrf_dfu, perform_silabs_ota
 from .partial import PartialState
 from .protocol import MANUFACTURER_ID, SERVICE_UUID
+from .transport import BleTransport, TcpTransport, Transport
 
 __version__ = "0.1.0"
 
@@ -95,10 +99,18 @@ __all__ = [
     "OpenDisplayDevice",
     "discover_devices",
     "discover_devices_with_adv",
+    "discover_ip_devices",
+    "IpDeviceInfo",
     "prepare_image",
     "PartialState",
+    # Transports
+    "Transport",
+    "TcpTransport",
+    "BleTransport",
     # Exceptions
     "OpenDisplayError",
+    "OpenDisplayConnectionError",
+    "OpenDisplayTimeoutError",
     "AuthenticationError",
     "AuthenticationFailedError",
     "AuthenticationRequiredError",

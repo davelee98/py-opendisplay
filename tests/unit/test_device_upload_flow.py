@@ -43,6 +43,8 @@ ERR_FRAME = b"\xff\xff"
 class _FakeConnection:
     """Replays scripted responses; records written commands and read timeouts."""
 
+    max_frame: int = 244  # Transport structural conformance (BLE GATT ceiling)
+
     def __init__(self, responses: list[bytes]) -> None:
         self.written: list[bytes] = []
         self.write_responses: list[bool] = []

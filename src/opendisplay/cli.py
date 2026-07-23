@@ -110,13 +110,29 @@ def _parse_compression_value(flag: str, value: str) -> float | str:
     return f
 
 
-def _device_kwargs(device: str, key: bytes | None, timeout: float) -> dict[str, Any]:
+def _device_kwargs(
+    device: str | None,
+    key: bytes | None,
+    timeout: float,
+    host: str | None = None,
+    port: int | None = None,
+    tls: bool = False,
+) -> dict[str, Any]:
     """Build OpenDisplayDevice constructor kwargs from CLI args.
 
-    Detects MAC addresses (contains ':') and macOS UUIDs (36-char with 4 dashes)
-    vs. human-readable device names.
+    With ``--host`` the device is addressed over TCP/LAN (WiFi). Otherwise a
+    ``--device`` MAC address (contains ':') / macOS UUID (36-char, 4 dashes) or a
+    human-readable device name is used over BLE.
     """
     kwargs: dict[str, Any] = {"timeout": timeout, "encryption_key": key}
+    if host is not None:
+        kwargs["host"] = host
+        if port is not None:
+            kwargs["port"] = port
+        kwargs["tls"] = tls
+        return kwargs
+    if not device:
+        _error("Provide --device (BLE) or --host (WiFi/LAN)")
     if ":" in device or (len(device) == 36 and device.count("-") == 4):
         kwargs["mac_address"] = device
     else:
@@ -125,15 +141,28 @@ def _device_kwargs(device: str, key: bytes | None, timeout: float) -> dict[str, 
 
 
 def _add_device_options(parser: argparse.ArgumentParser) -> None:
-    """Add shared --device, --key, --timeout options to a subcommand parser."""
-    parser.add_argument("--device", required=True, metavar="ADDR", help="Device MAC address or name")
+    """Add shared device-addressing (--device / --host) + --key/--timeout options."""
+    parser.add_argument("--device", metavar="ADDR", help="Device MAC address or name (BLE)")
+    parser.add_argument("--host", default=None, metavar="IP", help="Device IP/hostname (WiFi/LAN TCP transport)")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help="TCP port for --host (default: 2446 plaintext / 2447 TLS)",
+    )
+    parser.add_argument(
+        "--tls",
+        action="store_true",
+        help="Use TLS-PSK for the --host connection",
+    )
     parser.add_argument("--key", default=None, metavar="HEX", help="Encryption key as 32 hex characters")
     parser.add_argument(
         "--timeout",
         type=float,
         default=10.0,
         metavar="SECS",
-        help="BLE timeout in seconds (default: 10.0)",
+        help="Connection timeout in seconds (default: 10.0)",
     )
 
 
@@ -171,7 +200,7 @@ def _spinner() -> Progress:
 
 
 def _add_scan_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    p = subparsers.add_parser("scan", help="Scan for nearby OpenDisplay BLE devices")
+    p = subparsers.add_parser("scan", help="Scan for nearby OpenDisplay devices (BLE, or --lan for WiFi/mDNS)")
     p.add_argument(
         "--timeout",
         type=float,
@@ -179,12 +208,57 @@ def _add_scan_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
         metavar="SECS",
         help="Scan duration in seconds (default: 10.0)",
     )
+    p.add_argument("--lan", action="store_true", help="Discover WiFi devices via mDNS instead of BLE")
     p.add_argument("--json", dest="output_json", action="store_true", help="Output results as JSON")
     p.set_defaults(func=_cmd_scan)
 
 
 def _cmd_scan(args: argparse.Namespace) -> None:
-    _run(_scan(args.timeout, args.output_json))
+    if args.lan:
+        _run(_scan_lan(args.timeout, args.output_json))
+    else:
+        _run(_scan(args.timeout, args.output_json))
+
+
+async def _scan_lan(timeout: float, output_json: bool) -> None:
+    from .discovery_ip import discover_ip_devices
+
+    with _spinner() as progress:
+        progress.add_task(f"Browsing mDNS for {timeout:.0f}s...", total=None)
+        try:
+            devices = await discover_ip_devices(scan_seconds=timeout)
+        except RuntimeError as exc:
+            _error(str(exc))
+
+    if output_json:
+        rows = [
+            {
+                "name": info.name,
+                "host": info.host,
+                "port": info.port,
+                "mac": info.mac,
+                "tls": info.tls,
+                "fw": info.fw,
+                "cm": info.cm,
+            }
+            for _, info in sorted(devices.items())
+        ]
+        _stdout.print_json(json.dumps({"devices": rows}))
+        return
+
+    if not devices:
+        _console.print("No WiFi OpenDisplay devices found.")
+        return
+
+    table = Table(show_header=True)
+    table.add_column("Name")
+    table.add_column("Host")
+    table.add_column("Port")
+    table.add_column("MAC")
+    table.add_column("TLS")
+    for _, info in sorted(devices.items()):
+        table.add_row(info.name, info.host, str(info.port), info.mac or "—", "yes" if info.tls else "no")
+    _console.print(table)
 
 
 async def _scan(timeout: float, output_json: bool) -> None:
@@ -399,7 +473,7 @@ def _add_info_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
 
 def _cmd_info(args: argparse.Namespace) -> None:
     key = _parse_hex_key(args.key)
-    _run(_info(_device_kwargs(args.device, key, args.timeout), args.output_json))
+    _run(_info(_device_kwargs(args.device, key, args.timeout, args.host, args.port, args.tls), args.output_json))
 
 
 async def _info(device_kwargs: dict[str, Any], output_json: bool) -> None:
@@ -561,7 +635,7 @@ def _cmd_upload(args: argparse.Namespace) -> None:
     gamut = _parse_compression_value("--gamut", args.gamut)
     _run(
         _upload(
-            _device_kwargs(args.device, key, args.timeout),
+            _device_kwargs(args.device, key, args.timeout, args.host, args.port, args.tls),
             args.image,
             _REFRESH_CHOICES[args.refresh_mode],
             _DITHER_CHOICES[args.dither_mode],
@@ -683,7 +757,7 @@ def _add_reboot_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
 
 def _cmd_reboot(args: argparse.Namespace) -> None:
     key = _parse_hex_key(args.key)
-    _run(_reboot(_device_kwargs(args.device, key, args.timeout)))
+    _run(_reboot(_device_kwargs(args.device, key, args.timeout, args.host, args.port, args.tls)))
 
 
 async def _reboot(device_kwargs: dict[str, Any]) -> None:
@@ -694,7 +768,7 @@ async def _reboot(device_kwargs: dict[str, Any]) -> None:
             async with OpenDisplayDevice(**device_kwargs) as device:
                 await device.reboot()
                 rebooted = True
-        except (BLEConnectionError, BLETimeoutError):
+        except BLEConnectionError, BLETimeoutError:
             if not rebooted:
                 _error("BLE connection failed before reboot command could be sent.")
             # else: expected drop after reboot
@@ -714,7 +788,7 @@ def _add_sleep_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
 
 def _cmd_sleep(args: argparse.Namespace) -> None:
     key = _parse_hex_key(args.key)
-    _run(_sleep(_device_kwargs(args.device, key, args.timeout)))
+    _run(_sleep(_device_kwargs(args.device, key, args.timeout, args.host, args.port, args.tls)))
 
 
 async def _sleep(device_kwargs: dict[str, Any]) -> None:
@@ -725,7 +799,7 @@ async def _sleep(device_kwargs: dict[str, Any]) -> None:
             async with OpenDisplayDevice(**device_kwargs) as device:
                 await device.deep_sleep()
                 slept = True
-        except (BLEConnectionError, BLETimeoutError):
+        except BLEConnectionError, BLETimeoutError:
             if not slept:
                 _error("BLE connection failed before deep sleep command could be sent.")
             # else: expected drop after the device sleeps
@@ -758,7 +832,7 @@ def _add_export_config_parser(subparsers: argparse._SubParsersAction[argparse.Ar
 def _cmd_export_config(args: argparse.Namespace) -> None:
     key = _parse_hex_key(args.key)
     output = args.output or _default_export_path(args.device)
-    _run(_export_config(_device_kwargs(args.device, key, args.timeout), output))
+    _run(_export_config(_device_kwargs(args.device, key, args.timeout, args.host, args.port, args.tls), output))
 
 
 async def _export_config(device_kwargs: dict[str, Any], output_path: str) -> None:
@@ -785,7 +859,7 @@ def _add_write_config_parser(subparsers: argparse._SubParsersAction[argparse.Arg
 
 def _cmd_write_config(args: argparse.Namespace) -> None:
     key = _parse_hex_key(args.key)
-    _run(_write_config(_device_kwargs(args.device, key, args.timeout), args.input))
+    _run(_write_config(_device_kwargs(args.device, key, args.timeout, args.host, args.port, args.tls), args.input))
 
 
 async def _write_config(device_kwargs: dict[str, Any], input_path: str) -> None:

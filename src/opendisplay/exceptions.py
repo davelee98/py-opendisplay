@@ -9,13 +9,35 @@ class OpenDisplayError(Exception):
     pass
 
 
-class BLEConnectionError(OpenDisplayError):
+class OpenDisplayConnectionError(OpenDisplayError):
+    """Transport-neutral connection failure.
+
+    Superclass for connection errors on any transport (BLE or TCP/LAN). Callers
+    that don't care which transport failed should catch this; BLE-specific code
+    can still catch the ``BLEConnectionError`` subclass. Named to avoid shadowing
+    the builtin ``ConnectionError``.
+    """
+
+    pass
+
+
+class OpenDisplayTimeoutError(OpenDisplayError):
+    """Transport-neutral operation timeout.
+
+    Superclass for read/connect timeouts on any transport. Named to avoid
+    shadowing the builtin ``TimeoutError``.
+    """
+
+    pass
+
+
+class BLEConnectionError(OpenDisplayConnectionError):
     """BLE connection failed."""
 
     pass
 
 
-class BLETimeoutError(OpenDisplayError):
+class BLETimeoutError(OpenDisplayTimeoutError):
     """Operation timed out."""
 
     pass

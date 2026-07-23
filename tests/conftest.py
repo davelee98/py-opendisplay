@@ -1,5 +1,8 @@
 """Pytest configuration and fixtures."""
 
+from __future__ import annotations
+
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -7,6 +10,78 @@ from PIL import Image
 
 # Path to captured real protocol data
 FIXTURES_DIR = Path(__file__).parent / "fixtures/real_protocol_data"
+
+
+class FakeTransport:
+    """In-memory Transport implementation for driving device flows without bleak.
+
+    Replays a scripted list of response frames (bytes, or an Exception
+    class/instance to raise) and records every written command. Structurally
+    satisfies ``opendisplay.transport.Transport``, so it can back PIPE/crypto/
+    upload suites without a real BLE or TCP link.
+    """
+
+    def __init__(
+        self,
+        responses: list | None = None,
+        *,
+        max_frame: int = 244,
+        supports_write_without_response: bool = True,
+        device_name: str | None = "FakeDevice",
+    ) -> None:
+        self.max_frame = max_frame
+        self.supports_write_without_response = supports_write_without_response
+        self.device_name = device_name
+        self.written: list[bytes] = []
+        self.write_responses: list[bool] = []
+        self.drain_flags: list[bool] = []
+        self.timeouts: list[float] = []
+        self._responses: deque = deque(responses or [])
+        self._connected = False
+        self.drained = 0
+
+    async def connect(self) -> None:
+        self._connected = True
+
+    async def disconnect(self) -> None:
+        self._connected = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    async def write_command(self, data: bytes, response: bool = True, drain_stale: bool = True) -> None:
+        self.written.append(data)
+        self.write_responses.append(response)
+        self.drain_flags.append(drain_stale)
+
+    async def read_response(self, timeout: float = 5.0) -> bytes:
+        self.timeouts.append(timeout)
+        if not self._responses:
+            raise RuntimeError("FakeTransport: no responses left")
+        item = self._responses.popleft()
+        if isinstance(item, type) and issubclass(item, BaseException):
+            raise item("scripted")
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def drain_notifications(self) -> int:
+        self.drained += 1  # record the call; scripted responses are never dropped
+        return 0
+
+    async def clear_cache(self) -> bool:
+        return False
+
+
+@pytest.fixture
+def fake_transport():
+    """Factory fixture returning a configured :class:`FakeTransport`."""
+
+    def _make(responses: list | None = None, **kwargs: object) -> FakeTransport:
+        return FakeTransport(responses, **kwargs)
+
+    return _make
 
 
 @pytest.fixture

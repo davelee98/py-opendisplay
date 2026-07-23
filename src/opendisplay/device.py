@@ -76,6 +76,7 @@ from .protocol import (
     NFC_CHUNK_SIZE,
     NFC_INLINE_MAX,
     NFC_WRITE_MAX_TOTAL,
+    OD_LAN_TCP_PORT,
     PIPE_FLAG_PARTIAL,
     PIPE_FRAME_OVERHEAD,
     TIMEOUT_PIPE_START,
@@ -134,7 +135,7 @@ from .protocol.responses import (
     unpack_command_code,
     validate_nfc_response,
 )
-from .transport import BLEConnection
+from .transport import BLEConnection, TcpTransport, Transport
 
 if TYPE_CHECKING:
     from bleak.backends.device import BLEDevice
@@ -461,6 +462,11 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         mac_address: str | None = None,
         device_name: str | None = None,
         ble_device: BLEDevice | None = None,
+        transport: Transport | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        tls: bool = False,
+        psk: bytes | None = None,
         config: GlobalConfig | None = None,
         capabilities: DeviceCapabilities | None = None,
         timeout: float = 10.0,
@@ -474,10 +480,21 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
     ):
         """Initialize OpenDisplay device.
 
+        Exactly one addressing mode must be given: an explicit ``transport``, a
+        TCP/LAN ``host``, or a BLE address (``mac_address`` or ``device_name``).
+
         Args:
             mac_address: Device MAC address (mutually exclusive with device_name)
             device_name: Device name to resolve via BLE scan (mutually exclusive with mac_address)
             ble_device: Optional BLEDevice from HA bluetooth integration
+            transport: Explicit pre-built transport (BLE or TCP). Takes precedence
+                over host/mac addressing.
+            host: Device IP/hostname for a TCP/LAN connection (WiFi transport).
+            port: TCP port (default OD_LAN_TCP_PORT / 2446). TLS uses the derived
+                port; pass it explicitly here when connecting over TLS.
+            tls: Wrap the TCP connection in TLS-PSK (host mode only). Learned from
+                the mDNS ``tls`` TXT flag.
+            psk: Pre-shared key for the TLS-PSK handshake (host mode, tls=True).
             config: Optional full TLV config (skips interrogation)
             capabilities: Optional minimal device info (skips interrogation)
             timeout: BLE operation timeout in seconds (default: 10)
@@ -493,17 +510,30 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
                 transfer entirely — legacy stop-and-wait only, no 0x0080 probe.
 
         Raises:
-            ValueError: If neither or both mac_address and device_name provided
+            ValueError: If not exactly one addressing mode is provided
         """
-        # Validation: exactly one of mac_address or device_name must be provided
+        # Validation: exactly one addressing mode (explicit transport, TCP host,
+        # or a BLE address). These groups are mutually exclusive.
+        ble_addressed = bool(mac_address or device_name)
+        modes_given = sum((transport is not None, host is not None, ble_addressed))
+        if modes_given == 0:
+            raise ValueError("Must provide an addressing mode: transport=, host=, mac_address=, or device_name=")
+        if modes_given > 1:
+            raise ValueError(
+                "Provide exactly one addressing mode: transport=, host=, or a BLE address "
+                "(mac_address=/device_name=) — not a combination"
+            )
         if mac_address and device_name:
             raise ValueError("Provide either mac_address or device_name, not both")
-        if not mac_address and not device_name:
-            raise ValueError("Must provide either mac_address or device_name")
 
         # Store for resolution in __aenter__
         self._mac_address_param = mac_address
         self._device_name = device_name
+        self._transport_param = transport
+        self._host = host
+        self._port = port if port is not None else OD_LAN_TCP_PORT
+        self._tls = tls
+        self._psk = psk
         self._discovery_timeout = discovery_timeout
         self._ble_device = ble_device
         self._timeout = timeout
@@ -513,7 +543,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
 
         # Will be set after resolution
         self.mac_address = mac_address or ""  # Resolved in __aenter__
-        self._connection: BLEConnection | None = None  # Created after MAC resolution
+        self._connection: Transport | None = None  # Created after MAC resolution
 
         self._config = config
         self._capabilities = capabilities
@@ -544,7 +574,8 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
     async def __aenter__(self) -> OpenDisplayDevice:
         """Connect and optionally interrogate device."""
 
-        # Resolve device name to MAC address if needed
+        # Resolve device name to MAC address if needed (BLE addressing only;
+        # explicit-transport and host modes skip this block).
         if self._device_name:
             _LOGGER.debug("Resolving device name '%s' to MAC address", self._device_name)
 
@@ -569,17 +600,35 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             # MAC was provided directly — validated non-empty in __init__
             self.mac_address = self._mac_address_param or ""
 
-        # Create connection with resolved MAC
-        self._connection = BLEConnection(
-            self.mac_address,
-            self._ble_device,
-            self._timeout,
-            max_attempts=self._max_attempts,
-            use_services_cache=self._use_services_cache,
-            disconnected_callback=self._on_ble_disconnect,
-        )
+        # Transport selection (mutually exclusive, validated in __init__):
+        # explicit transport= > host=/port= (TCP) > BLE address (default).
+        if self._transport_param is not None:
+            self._connection = self._transport_param
+        elif self._host is not None:
+            self._connection = TcpTransport(
+                self._host,
+                self._port,
+                timeout=self._timeout,
+                tls=self._tls,
+                psk=self._psk,
+            )
+        else:
+            self._connection = BLEConnection(
+                self.mac_address,
+                self._ble_device,
+                self._timeout,
+                max_attempts=self._max_attempts,
+                use_services_cache=self._use_services_cache,
+                disconnected_callback=self._on_disconnect,
+            )
 
         await self._conn.connect()
+
+        # Over TCP the device gates AES-CCM decrypt on origin: TLS frames are
+        # already-secure, plaintext frames are never decrypted. Running the
+        # app-layer challenge/response would double-encrypt (and hit the 154 B
+        # encrypted-chunk cap), so authentication is BLE-only.
+        is_tcp = isinstance(self._connection, TcpTransport)
 
         # The link is now up with notifications registered. If any step below
         # raises, __aexit__ will NOT run (Python only calls it when __aenter__
@@ -589,8 +638,8 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         # CancelledError from an outer asyncio.timeout() (e.g. the HA config-flow
         # connection probe).
         try:
-            # Authenticate before any other commands if key provided
-            if self._encryption_key is not None:
+            # Authenticate before any other commands if key provided (BLE only).
+            if self._encryption_key is not None and not is_tcp:
                 await self.authenticate(self._encryption_key)
 
             # Auto-interrogate if no config or capabilities provided
@@ -622,8 +671,8 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         self._clear_session()
 
     @property
-    def _conn(self) -> BLEConnection:
-        """Return active BLE connection, raising RuntimeError if not connected."""
+    def _conn(self) -> Transport:
+        """Return the active transport, raising RuntimeError if not connected."""
         if self._connection is None:
             raise RuntimeError("Device not connected")
         return self._connection
@@ -658,8 +707,8 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         self._nonce_counter = 0
         self._auth_time = None
 
-    def _on_ble_disconnect(self) -> None:
-        """Handle an unexpected BLE drop: forget the (now-dead) session and pipe state."""
+    def _on_disconnect(self) -> None:
+        """Handle an unexpected link drop: forget the (now-dead) session and pipe state."""
         _LOGGER.debug("Link to %s dropped; clearing session state", self.mac_address)
         self._clear_session()
         # All pipe negotiation/capability state is per-connection (Part 1 §1.1).
@@ -1837,6 +1886,20 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         state.width, state.height = processed_image.size
         state.bytes_per_pixel = 1
 
+    def _direct_write_chunk_size(self) -> int:
+        """Data bytes per 0x71 DIRECT_WRITE chunk for the current transport.
+
+        Encrypted BLE session -> ENCRYPTED_CHUNK_SIZE (154); plain BLE ->
+        CHUNK_SIZE (230); a large-frame LAN transport -> ``max_frame - 2`` (the
+        2-byte opcode header), e.g. 4094 for a 4096-byte LAN frame.
+        """
+        if self._session_key is not None:
+            return ENCRYPTED_CHUNK_SIZE
+        max_frame = self._conn.max_frame
+        if max_frame > DEFAULT_MAX_FRAME:
+            return max_frame - 2
+        return CHUNK_SIZE
+
     async def _send_partial_chunks(
         self,
         remaining: bytes,
@@ -1850,14 +1913,14 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         before the refresh started (firmware aborts the partial on such a NACK,
         so a subsequent full upload is safe).
         """
-        chunk_size = ENCRYPTED_CHUNK_SIZE if self._session_key is not None else CHUNK_SIZE
+        chunk_size = self._direct_write_chunk_size()
         total_stream_bytes = len(stream_bytes)
         bytes_sent = total_stream_bytes - len(remaining)
         offset = 0
         while offset < len(remaining):
             chunk = remaining[offset : offset + chunk_size]
             # Write Without Response; the per-chunk ACK read below keeps flow control.
-            await self._write(build_direct_write_data_command(chunk), response=False)
+            await self._write(build_direct_write_data_command(chunk, max_data_len=chunk_size), response=False)
             ack = await self._read(self.TIMEOUT_ACK)
             nack = parse_nack(ack)
             if nack is not None:
@@ -1990,7 +2053,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
                     # committed on the device, so falling back to full and
                     # re-baselining state on an unknown outcome would be unsafe.
                     raise
-                except (AuthenticationError, IntegrityCheckError):
+                except AuthenticationError, IntegrityCheckError:
                     # An auth/session failure or a decrypt-integrity rejection is NOT
                     # a clean, safe-to-retry protocol abort. Auth errors MUST surface
                     # so the caller (e.g. Home Assistant) can trigger reauth instead
@@ -2049,7 +2112,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
                 state.last_image = None
                 return "fallback_full"
             validate_ack_response(response, CommandCode.DIRECT_WRITE_PARTIAL_START)
-        except (BLETimeoutError, InvalidResponseError):
+        except BLETimeoutError, InvalidResponseError:
             _LOGGER.info("Partial upload start was not acknowledged; falling back to full upload")
             return "fallback_full"
 
@@ -2111,6 +2174,9 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             bool(display_cfg and display_cfg.supports_pipe_write)
             and self._max_queue_size > 1
             and not (self._pipe_probed and not self._pipe_supported)
+            # PIPE_WRITE (0x0080-0x82) is forbidden on LAN (SECTION 9 rule 3): a
+            # large-frame transport streams via plain DIRECT_WRITE instead.
+            and self._conn.max_frame <= DEFAULT_MAX_FRAME
         )
         if pipe_eligible:
             total_size = len(image_data)
@@ -2234,14 +2300,14 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         bytes_sent = 0
         chunks_sent = 0
 
+        chunk_size = self._direct_write_chunk_size()
         while bytes_sent < len(image_data):
-            chunk_size = ENCRYPTED_CHUNK_SIZE if self._session_key is not None else CHUNK_SIZE
             chunk_data = image_data[bytes_sent : bytes_sent + chunk_size]
 
             # Send the data chunk without waiting for the ATT write confirmation
             # (Write Without Response). Flow control is preserved by the per-chunk
             # application ACK read below, so only one write is ever in flight.
-            await self._write(build_direct_write_data_command(chunk_data), response=False)
+            await self._write(build_direct_write_data_command(chunk_data, max_data_len=chunk_size), response=False)
             bytes_sent += len(chunk_data)
             chunks_sent += 1
 
@@ -2293,7 +2359,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         Returns:
             PipeParams (effective, post-min-rule) on success, else None.
         """
-        req_frame = DEFAULT_MAX_FRAME  # HA GATT ceiling; also our client_max_frame
+        req_frame = self._conn.max_frame  # transport frame ceiling; our client_max_frame (BLE=244)
         # The 0x0080 is the single pre-stream write; _write re-authenticates here
         # (once, never again mid-stream).
         await self._write(
@@ -2365,7 +2431,7 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
             _PipePartialEtagMismatch: NACK 0x05 — caller skips 0x76, goes full.
             _PipePartialRejected: NACK 0x06/0x07 — caller skips 0x76, goes full.
         """
-        req_frame = DEFAULT_MAX_FRAME  # HA GATT ceiling; also our client_max_frame
+        req_frame = self._conn.max_frame  # transport frame ceiling; our client_max_frame (BLE=244)
         partial = PipePartialRequest(old_etag=old_etag, x=region.rx, y=region.ry, w=region.rw, h=region.rh)
         # The 0x0080 is the single pre-stream write; _write re-authenticates here
         # (once, never again mid-stream).

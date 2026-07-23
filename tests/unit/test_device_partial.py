@@ -142,6 +142,7 @@ def test_valid_partial_never_sends_0x70_and_uses_uncompressed_0x76(monkeypatch):
     async def read_response(timeout: float) -> bytes:
         return responses.pop(0)
 
+    device._connection = ScriptedConn([])  # supplies max_frame for chunk sizing
     monkeypatch.setattr(device, "_write", capture_write)
     monkeypatch.setattr(device, "_read", read_response)
 
@@ -299,6 +300,7 @@ def test_partial_request_uses_partial_even_when_full_compressed_is_smaller(monke
     async def fail_full_upload(*args, **kwargs) -> None:
         raise AssertionError("partial request unexpectedly fell back to full upload")
 
+    device._connection = ScriptedConn([])  # supplies max_frame for chunk sizing
     monkeypatch.setattr(device, "_write", capture_write)
     monkeypatch.setattr(device, "_read", read_response)
     monkeypatch.setattr(device, "_execute_upload", fail_full_upload)
