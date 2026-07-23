@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-opendisplay"
-version = "8.0.2"
+version = "8.0.3"
 description = "Python library for OpenDisplay BLE e-paper displays"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 authors = [
     {name = "g4bri3lDev", email = "admin@g4bri3l.de"}
 ]
