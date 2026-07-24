@@ -16,6 +16,7 @@ from epaper_dithering import ColorScheme, DitherMode, dither_image
 from PIL import Image
 
 from .crypto import (
+    aes_cmac,
     compute_challenge_response,
     compute_server_proof,
     decrypt_response,
@@ -611,12 +612,20 @@ class OpenDisplayDevice:  # pylint: disable=too-many-instance-attributes
         if self._transport_param is not None:
             self._connection = self._transport_param
         elif self._host is not None:
+            # The TLS-PSK key is NOT the master key: firmware deriveTlsPsk() uses
+            # AES-CMAC(master_key, "opendisplay-tls-psk") so the TLS channel never
+            # reuses the key that protects the app-layer AES-CCM session. Derive it
+            # here when the caller passed only encryption_key — handing OpenSSL an
+            # empty PSK fails the handshake locally as PSK_IDENTITY_NOT_FOUND.
+            psk = self._psk
+            if psk is None and self._tls and self._encryption_key:
+                psk = aes_cmac(self._encryption_key, b"opendisplay-tls-psk")
             self._connection = TcpTransport(
                 self._host,
                 self._port,
                 timeout=self._timeout,
                 tls=self._tls,
-                psk=self._psk,
+                psk=psk,
             )
         else:
             self._connection = BLEConnection(
